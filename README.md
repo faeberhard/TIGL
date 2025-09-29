@@ -1,0 +1,2 @@
+# TIGL
+Tranquility Index Glarus
