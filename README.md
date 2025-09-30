@@ -18,7 +18,7 @@ tranquility_glarus/
 │   ├── bird_species/         # Swiss Bird Atlas (Vogelwarte)
 │   ├── noise/                # Road, rail, aviation noise (BAFU, SIL)
 │   ├── light_emission/       # LABES dataset (BAFU)
-│   ├── smell/                # Agricultural + features from TLM
+│   ├── stench/                # Agricultural + features from TLM (waste inciniration plants and wastewater treatment facilities)
 │   ├── presence_people/      # Flickr API derived data
 │   ├── remoteness/           # LABES accessibility dataset
 │   ├── arealstatistik/       # Arealstatistik (swisstopo)
@@ -31,18 +31,24 @@ tranquility_glarus/
 │   └── patches/              # High-tranquility patch shapefiles + statistics
 ```
 
-## Data Requirements
+## Data Requirements and Script Description
 
-The following datasets must be obtained:
+This script computes the **Tranquility Index** for the canton of Glarus and forms part of my master's thesis *"A participative approach towards modeling tranquility: A case study in Glarus, Switzerland"* at the Department of Geography, University of Zurich (GIUZ). Further methodological details and descriptions can be found in the thesis.  
+
+The following datasets must be obtained and placed in the `/data/` directory structure provided in the repository:  
 - **Boundaries:** SwissBOUNDARIES3D (swisstopo)  
 - **Topographic Data:** SwissTLM3D & TLMRegio (swisstopo)  
 - **Air Pollution:** NO₂, PM₁₀, PM₂.₅, O₃ rasters (BAFU)  
 - **Noise:** Road and rail noise (BAFU); aviation noise via SIL perimeter (BAZL)  
-- **Light Emission:** LABES dataset
-- **Remoteness:** LABES travel-time dataset  
-- **Bird song:** Swiss Bird Atlas (Vogelwarte)  
+- **Light Emission & Remoteness:** LABES datasets  
+- **Bird Song:** Swiss Bird Atlas (Vogelwarte)  
 - **Land Cover:** Arealstatistik (swisstopo)  
 - **Human Presence:** Flickr API (geotagged images; must be collected by user)  
 
-For reproducibility, the repository provides placeholders and directory structure under /data/.
-After obtaining the datasets, place them in the respective subfolders following the provided structure.
+The workflow proceeds in four main steps:  
+- **Prepares data:** Loads packages, sets project root, extracts and buffers the Glarus boundary, creates a 100 m raster template, and clips national datasets (TLM, FLOZ, Arealstatistik).  
+- **Generates indicators:** Processes forests, streams, lakes, roads, infrastructure, and urbanization with visibility analyses and distance-decay functions. Additional layers include noise, air pollution, light emission, remoteness, bird species, stench, and human presence.  
+- **Combines factors:** Normalizes all rasters to 0–100, applies AHP weights, computes positive and negative indices, and aggregates them into the final Tranquility Index.  
+- **Analyzes results:** Identifies dominant factors per cell, produces histograms, extracts and characterizes tranquil patches, and cross-tabulates tranquility with land cover.  
+
+**Outputs:** The script saves tranquility rasters, patch shapefiles, and visualizations. The workflow can be adapted to other case studies by adjusting input data, decay parameters, weights and paths.

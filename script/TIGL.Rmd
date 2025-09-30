@@ -1,0 +1,2637 @@
+---
+title: "Computation of the Tranquility Index for Glarus"
+output: html_document
+date: "2025-04-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install and activate packages
+```{R Install necessary packages}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+# -----------------------------------------------------
+# Default CRAN mirror
+# -----------------------------------------------------
+local({
+  r <- getOption("repos")
+  r["CRAN"] <- "https://cran.r-project.org"
+  options(repos = r)
+})
+
+# -----------------------------------------------------
+# Package installer/loader
+# -----------------------------------------------------
+check_pkg <- function(pkgs) {
+  for (x in pkgs) {
+    if (!requireNamespace(x, quietly = TRUE)) {
+      install.packages(x, dep = TRUE)
+    }
+    suppressPackageStartupMessages(library(x, character.only = TRUE))
+  }
+}
+
+# Define packages
+pkgs <- c(
+  "httr", "jsonlite",              # API and JSON handling
+  "sf", "dplyr", "terra",          # spatial + data wrangling
+  "spatstat.geom", "spatstat.explore", # spatial statistics
+  "here",                          # project structure
+  "stringr", "purrr", "fs",        # helpers: string, functional, filesystem
+  "lubridate",                     # date-time handling
+  "ggplot2"                        # visualization
+)
+
+# Install + load
+check_pkg(pkgs)
+
+# tools wird in R immer geladen, aber falls nicht:
+if (!"tools" %in% loadedNamespaces()) {
+  library(tools)
+}
+
+# -----------------------------------------------------
+# Project root for here()
+# -----------------------------------------------------
+# Tell `here` where this script lives (your Rmd file)
+here::i_am("MA.Rmd")
+
+# Alternatively: set explicit root folder
+here::set_here("/Users/fabioeberhard/Desktop/data_MA")
+
+# Confirm root
+cat("Project root is set to:", here::here(), "\n")
+```
+
+## Create raster and polygon template of study area
+```{R Create and save raster to align to }
+# Extract Glarus boundary from swissBOUNDARIES3D 
+kantonsgebiet <- st_read(
+  here("boundaries", "swissBOUNDARIES3D_1_5_LV95_LN02.gpkg"),
+  layer = "tlm_kantonsgebiet"
+)
+
+glarus_boundary <- kantonsgebiet %>%
+  dplyr::filter(kantonsnummer == 8)   # Kanton Glarus
+
+str(kantonsgebiet$kantonsnummer)
+
+# Save Glarus boundary
+st_write(glarus_boundary,
+         here("boundaries", "glarus_boundary.gpkg"),
+         layer = "glarus_boundary",
+         driver = "GPKG",
+         delete_dsn = TRUE)
+
+# Load and buffer Glarus boundary 
+boundary <- st_read(here("boundaries", "glarus_boundary.gpkg"))
+boundary <- st_transform(boundary, 2056)               # Swiss LV95
+boundary_buffer <- st_buffer(boundary, dist = 15000)   # 15 km buffer
+
+# --- Save buffered boundary as vector (GeoPackage) ---
+st_write(boundary_buffer,
+         here("boundaries", "glarus_boundary_15km.gpkg"),
+         layer = "glarus_boundary_15km",
+         driver = "GPKG",
+         delete_dsn = TRUE)
+
+# Convert to terra vector 
+boundary_vect <- vect(boundary_buffer)
+
+# Create raster template (100x100 m) 
+template_raster <- rast(
+  extent = ext(boundary_vect),
+  resolution = 100,
+  crs = "EPSG:2056"
+)
+
+# Fill with 0 (empty template)
+values(template_raster) <- 0
+
+# Mask to buffered boundary (keeps only inside polygon)
+template_masked <- mask(template_raster, boundary_vect)
+
+# Save template raster 
+writeRaster(template_masked,
+            here("boundaries","glarus_boundary_15km.tif"),
+            overwrite = TRUE)
+
+# Reload saved outputs 
+glarus_polygon_15km <- st_read(here("boundaries", "glarus_boundary_15km.gpkg"))
+glarus_raster_15km  <- rast(here("boundaries", "glarus_boundary_15km.tif"))
+```
+
+## Clip the TLM datasets
+```{r Clip TLM data to extent}
+# Vector data paths: only the 2 TLM files
+vector_paths <- c(
+  here("TLM", "swissTLMRegio_Product_LV95.gpkg"),
+  here("TLM_Regio", "swissTLMRegio_Product_LV95.gpkg")
+)
+
+# Output folder
+output_folder <- here("TLM", "output")
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+# Loop over both TLM gpkg files
+for (vector_path in vector_paths) {
+  
+  message("Processing: ", vector_path)
+  
+  # Get layer names
+  layers_info <- st_layers(vector_path)
+  layer_names <- layers_info$name
+  
+  # Create output GPKG name
+  output_gpkg <- file.path(
+    output_folder,
+    paste0(tools::file_path_sans_ext(basename(vector_path)), "_clipped.gpkg")
+  )
+  
+  # Loop over all layers inside the GPKG
+  for (layer_name in layer_names) {
+    
+    message("  Clipping layer: ", layer_name)
+    
+    # Read the specific layer
+    vector_layer <- st_read(vector_path, layer = layer_name, quiet = TRUE)
+    
+    # Clip with Glarus 15km polygon
+    vector_layer_clipped <- st_intersection(vector_layer, glarus_polygon_15km)
+    
+    # Save clipped layer into one output GPKG per input file
+    st_write(
+      vector_layer_clipped,
+      output_gpkg,
+      layer = layer_name,
+      delete_layer = TRUE,
+      append = TRUE
+    )
+  }
+}
+
+```
+
+## Forest
+```{r Extract forest polygons}
+# Read in data and define paths 
+output_path <- here("TLM", "output", "forest", "forest_tlm3d.gpkg")
+
+tlm_bb <- st_read(here("TLM", "output", "SWISSTLM3D_2025_clipped.gpkg"),
+                      layer = "tlm_bb_bodenbedeckung")
+
+tlm_forest <- tlm_bb %>%
+  filter(objektart == "Wald")
+
+
+st_write(tlm_forest,
+         dsn = output_path,
+         layer = "forest_tlm3d",
+         driver = "GPKG",
+         delete_layer = TRUE)
+```
+
+```{r Create point grid for forest polygons }
+# Read in forest polygons
+forest_polygons <- st_read(here("TLM", "output", "forest", "forest_tlm3d.gpkg"))
+
+# Create raster template with 100 m resolution
+template_raster <- rast(ext(forest_polygons), resolution = 200)
+crs(template_raster) <- crs(forest_polygons)
+
+# Rasterize the polygon to get the area mask
+mask_raster <- rasterize(vect(forest_polygons), template_raster, field = 1)
+
+# Convert raster cells to points (centroids of cells)
+raster_points <- as.points(mask_raster, na.rm = TRUE)
+
+# Convert to sf object
+points_sf_forest <- st_as_sf(raster_points)
+
+# Save output 
+st_write(points_sf_forest, 
+         dsn = here("visibility_analysis", "forest","viewpoints","grid_200m_forest.gpkg"),
+         layer = "grid200m_forest",
+         driver = "GPKG",
+         delete_layer = TRUE)
+
+
+```
+
+
+## Streams
+```{r Filter FLOZ dataset }
+# Paths
+in_path  <- here("TLM", "FLOZ_LV95", "FLOZ.shp")
+out_path <- here("TLM", "output", "streams", "FLOZ_filtered_clipped.gpkg")
+layer_nm <- "FLOZ_filtered_clipped"
+
+# Read 
+streams  <- st_read(in_path, quiet = TRUE)
+
+
+# Validity & CRS 
+streams  <- st_make_valid(streams)
+boundary <- st_make_valid(boundary)
+if (st_crs(glarus_polygon_15km) != st_crs(streams)) glarus_boundary_15km <- st_transform(glarus_boundary_15km, st_crs(streams))
+
+# Filter OBJECTVAL (exclude listed values) 
+exclude_vals <- c("Bach_U", "Bachachs", "Fluss_U", "Kanal", "Seeachse")
+streams_filt <- streams %>% filter(!(OBJECTVAL %in% exclude_vals))
+
+# Drop Z/M to avoid 3D/M issues
+streams_filt <- st_zm(streams_filt, drop = TRUE, what = "ZM")
+
+# Clip using only the boundary geometry (prevents duplicate columns) 
+boundary_geom <- st_union(st_geometry(glarus_polygon_15km))  # dissolve to a single polygon
+streams_clip  <- st_intersection(streams_filt, boundary_geom)
+
+# Keep lines only and drop empties
+streams_clip <- st_collection_extract(streams_clip, "LINESTRING") %>%
+  filter(!st_is_empty(geometry))
+
+# Ensure unique, driver-safe field names (belt-and-braces)
+names(streams_clip) <- make.names(names(streams_clip), unique = TRUE)
+
+# Save 
+st_write(streams_clip,
+         dsn   = out_path,
+         layer = layer_nm,
+         driver = "GPKG",
+         delete_layer = TRUE)
+
+
+```
+
+
+```{r FlOZ points grid for viewshed analysis}
+# Inputs / outputs
+in_path  <- here("TLM", "output", "streams", "FLOZ_filtered_clipped.gpkg")
+out_path <- here("visibility_analysis", "streams", "viewpoints", "FLOZ_streams_viewpoints_100m.gpkg")
+
+# Read and prep
+lines <- st_read(in_path, quiet = TRUE) %>%
+  st_cast("LINESTRING", warn = FALSE) %>%           # handle MULTILINESTRING
+  st_make_valid()
+
+# Safety: require a projected CRS in metres
+if (isTRUE(st_is_longlat(lines))) {
+  stop("Input must be in a projected CRS (metres). Reproject (e.g., to EPSG:2056) and rerun.")
+}
+
+# Sampling helper: returns POINTS along one LINESTRING
+sample_every_100m <- function(geom, step = 100) {
+  len <- as.numeric(st_length(geom))                # metres
+  if (is.na(len) || len == 0) return(st_sfc())     # skip empty/zero-length
+  # distances along the line at which to place points (always at least one)
+  dists <- if (len < step) 0 else seq(0, len, by = step)
+  # Convert absolute distances to relative [0,1] positions
+  pos <- unique(pmin(1, dists / len))
+  st_line_sample(geom, sample = pos)  %>%
+    st_cast("POINT")          
+}
+
+# Apply per feature and bind
+points_list <- st_geometry(lines) %>%
+  purrr::map(sample_every_100m)
+
+# Flatten to a single POINT geometry column
+points_sfc <- do.call(c, points_list)
+
+# Wrap into an sf object (keep CRS)
+points_sf <- st_sf(geometry = points_sfc, crs = st_crs(lines))
+
+# Drop empties (in case of zero-length parts)
+points_sf <- points_sf[!st_is_empty(points_sf), ]
+
+# Save
+st_write(points_sf, out_path, driver = "GPKG", delete_dsn = TRUE, quiet = TRUE)
+```
+
+## Lakes
+```{r Lakes point grid for visibility analysis}
+# Create hectare grid for lakes (stehende Gewaesser)
+output_path = here("visibility_analysis", "lakes", "viewpoints", "grid100m_lakes.gpkg")
+
+# Load polygon layer from GeoPackage
+stehende_gewaesser <- st_read(
+  here("TLM", "output", "swissTLMRegio_Product_LV95_clipped.gpkg"), 
+  layer = "tlmregio_hydrography_lake") 
+
+# Create raster template with 100 m resolution
+template_raster <- rast(ext(stehende_gewaesser), resolution = 100)
+crs(template_raster) <- crs(stehende_gewaesser)
+
+# Rasterize the polygon to get the area mask
+mask_raster <- rasterize(vect(stehende_gewaesser), template_raster, field = 1)
+
+# Convert raster cells to points (centroids of cells)
+raster_points <- as.points(mask_raster, na.rm = TRUE)
+
+# Convert to sf object
+points_sf_lakes <- st_as_sf(raster_points)
+
+# Save output 
+st_write(points_sf_lakes, 
+         dsn = output_path,
+         layer = "grid100m_lakes",
+         driver = "GPKG",
+         delete_layer = TRUE)
+```
+
+## Roads
+```{r Filter road dataset }
+# Define input and output
+input_path <- here("TLM", "output", "SWISSTLM3D_2025_clipped.gpkg")
+layer_name <- "tlm_strassen_strasse"
+output_folder <- here("TLM", "output", "roads")
+
+# Create output folder if it doesn't exist
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# Load the data
+roads <- st_read(input_path, layer = layer_name)
+
+# Values to exclude
+exclude_objektart <- c(
+  "1m Weg", "1m Wegfragment", "2m Weg", "2m Wegfragment",
+  "Klettersteig", "Markierte Spur", "Platz", "Provisorium", "Verbindung", "Ausfahrt", "Zufahrt", "Raststätte"
+)
+
+exclude_kunstbaute <- c("Galerie", "Gedeckte Bruecke")
+
+# Filter out excluded values
+roads_filtered <- roads %>%
+  filter(!(objektart %in% exclude_objektart)) %>%
+  filter(!(kunstbaute %in% exclude_kunstbaute | is.na(kunstbaute)))
+
+# Get unique remaining objektart values
+unique_objektart <- unique(roads_filtered$objektart)
+
+# Loop over each objektart category and write to GPKG (without union)
+for (cat in unique_objektart) {
+  cat_clean <- str_replace_all(cat, "[^[:alnum:]_]", "_")  # Clean name for filename
+  roads_cat <- roads_filtered %>%
+    filter(objektart == cat)
+
+  out_path <- file.path(output_folder, paste0("roads_", cat_clean, ".gpkg"))
+
+  st_write(roads_cat, out_path, driver = "GPKG", delete_dsn = TRUE)
+}
+
+
+```
+
+
+```{r Union all road segments }
+# Define input and output folders
+input_folder <- here("TLM", "output", "roads")
+output_folder <- here("TLM", "output", "roads", "roads_union_by_type")
+
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+gpkg_files <- dir_ls(input_folder, regexp = "\\.gpkg$", recurse = FALSE)
+
+# Define OBJEKTART name-based groupings
+road_groups <- list(
+  "roads_autobahn_autostrasse_union" = c("Autobahn", "Autostrasse"),
+  "roads_10m_8m_6m_union" = c("10m Strasse", "8m Strasse", "6m Strasse"),
+  "roads_4m_3m_union" = c("4m Strasse", "3m Strasse")
+)
+
+# Loop through road type groups
+for (output_name in names(road_groups)) {
+  selected_labels <- road_groups[[output_name]]
+  all_union_parts <- list()
+
+  for (file in gpkg_files) {
+    roads <- st_read(file, quiet = TRUE)
+    roads <- roads[st_geometry_type(roads) %in% c("LINESTRING", "MULTILINESTRING"), ]
+    if (nrow(roads) == 0) next
+
+    # If your OBJEKTART is numeric, map to name first
+    # Otherwise filter directly on label column
+    class_roads <- roads %>% filter(objektart %in% selected_labels)
+    if (nrow(class_roads) == 0) next
+
+    all_union_parts[[length(all_union_parts) + 1]] <- class_roads
+  }
+
+  if (length(all_union_parts) == 0) next
+
+  merged <- do.call(rbind, all_union_parts)
+  unioned <- st_union(merged)
+  unioned_sf <- st_sf(geometry = unioned, crs = st_crs(merged))
+
+  output_file <- file.path(output_folder, paste0(output_name, ".gpkg"))
+  st_write(unioned_sf, output_file, delete_dsn = TRUE)
+}
+```
+
+## Extract infrastrcture features from TLM 
+```{r}
+# Input and output paths
+input_gpkg <- here("TLM", "output", "SWISSTLM3D_2025_clipped.gpkg")
+output_folder <- here("infrastructure_TLM")
+
+# Create output folder if it doesn't exist
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# Define the list of layers to extract
+layers <- c(
+  "tlm_bauten_versorgungsbaute_pkt",
+  "tlm_bauten_verkehrsbaute_lin",
+  "tlm_bauten_verbauung",
+  "tlm_areale_nutzungsareal",
+  "tlm_bauten_sportbaute_lin",
+  "tlm_bauten_sportbaute_ply",
+  "tlm_bauten_leitung",
+  "tlm_bauten_staubaute",
+  "tlm_areale_verkehrsareal",
+  "tlm_areale_freizeitareal",
+  "tlm_bauten_verkehrsbaute_ply",
+  "tlm_eo_einzelobjekt",
+  "tlm_gewaesser_fliessgewaesser"
+)
+
+# Process and export each layer
+for (layer_name in layers) {
+  message("Processing: ", layer_name)
+
+  # Read layer
+  layer_data <- st_read(input_gpkg, layer = layer_name, quiet = TRUE)
+
+  # Output path
+  output_path <- file.path(output_folder, paste0(layer_name, ".gpkg"))
+
+  # Write to file
+  st_write(layer_data, output_path, driver = "GPKG", delete_dsn = TRUE)
+}
+```
+
+## Create point grid for power lines (TLM)
+```{r}
+# Input and output paths
+input_path <- here("infrastructure_TLM", "tlm_bauten_leitung.gpkg")
+output_path <- here("visibility_analysis", "infrastructure", "power_lines", "viewpoints", "viewpoints_leitung_50m.gpkg")
+
+# Read the line data
+lines <- st_read(input_path, quiet = TRUE)
+
+# Keep only LINESTRING and MULTILINESTRING geometries
+lines <- lines[st_geometry_type(lines) %in% c("LINESTRING", "MULTILINESTRING"), ]
+
+# Merge all geometries
+merged <- st_union(lines)
+
+# Ensure LINESTRING geometry
+merged_lines <- st_cast(merged, "LINESTRING", warn = FALSE)
+
+# Sample points every 50 meters
+samples <- st_line_sample(merged_lines, density = 1 / 50)
+
+# Convert MULTIPOINT → POINT
+points <- st_cast(samples, "POINT")
+
+# Wrap as sf object
+points_sf <- st_sf(geometry = points, crs = st_crs(lines))
+
+# Write to GeoPackage
+st_write(points_sf, output_path, delete_dsn = TRUE)
+```
+
+
+## Create point grid for staubauten / Verkehrsareal
+```{r}
+# Define input and output layers
+input_layers <- list(
+  staubaute = list(
+    path = here("infrastructure_TLM", "tlm_bauten_staubaute.gpkg"),
+    output = here("visibility_analysis", "infrastructure", "staubauten", "viewpoints", "viewpoints_staubaute_50m.gpkg")
+  ),
+  verkehrsareal = list(
+    path = here("infrastructure_TLM", "tlm_areale_verkehrsareal.gpkg"),
+    output = here("visibility_analysis", "infrastructure", "verkehrsareal", "viewpoints", "viewpoints_verkehrsareal_50m.gpkg")
+  )
+)
+
+# Loop over both layers
+for (layer in names(input_layers)) {
+  
+  # Read polygon data
+  polygons <- st_read(input_layers[[layer]]$path, quiet = TRUE)
+  
+  if (nrow(polygons) == 0) next  # Skip if empty
+  
+  # Create raster template at 50 m resolution
+  template_raster <- rast(ext(polygons), resolution = 50)
+  crs(template_raster) <- crs(polygons)
+  
+  # Rasterize the polygons
+  mask_raster <- rasterize(vect(polygons), template_raster, field = 1)
+  
+  # Convert raster cells to points (cell centroids)
+  raster_points <- as.points(mask_raster, na.rm = TRUE)
+  points_sf_raster <- st_as_sf(raster_points)
+  
+  # Find polygons without any raster point intersection
+  intersections <- st_intersects(polygons, points_sf_raster)
+  no_intersection_idx <- which(lengths(intersections) == 0)
+  
+  # Create centroids for polygons with no raster points
+  centroids_needed <- st_centroid(polygons[no_intersection_idx, ])
+  
+  # Convert both to geometry-only sf
+  geom_raster <- st_as_sf(st_geometry(points_sf_raster), crs = st_crs(polygons))
+  geom_centroids <- st_as_sf(st_geometry(centroids_needed), crs = st_crs(polygons))
+  
+  # Merge geometries
+  combined_points <- rbind(geom_raster, geom_centroids)
+  
+  # Save output
+  st_write(combined_points, input_layers[[layer]]$output, delete_layer = TRUE)
+}
+```
+
+
+# Reclassify output from Viewshed tool in QGIS 
+
+Here, the resulting viewshed from the QGIS tool "Viewshed" by Cuckovic (2016) are processed further. Adjust the paths according to your file name created in QGIS. 
+
+## Infrastructure, lakes and forest
+```{r Reclassify visibility raster output from QGIS (Lakes, forest, urbanization), rescale them to 100x100m and clip with forest polygons}
+# Define input files and their corresponding output folders
+input_files <- c(
+  here("visibility_analysis", "lakes", "lakes_viewshed_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "power_lines", "viewshed_power_lines_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "staubauten", "viewshed_staubaute_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "verkehrsareal", "viewshed_verkehrsareal_adj.tif"),
+  here("visibility_analysis", "infrastructure", "versorgungsbauten", "versorgungsbauten_viewshed_QGISadj_v2.tif "),
+  here("visibility_analysis", "infrastructure", "rails", "viewshed_rails_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "roads", "viewshed_roads_4_3m_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "roads", "viewshed_roads_10_8_6m_QGIS_adj.tif"),
+  here("visibility_analysis", "infrastructure", "roads", "viewshed_roads_autobahn_QGIS_adj.tif"),
+  here("visibility_analysis", "urbanization", "buildings_viewshed_QGIS_adj.tif"),
+  here("visibility_analysis", "forest", "forest_viewshed_QGIS_adj.tif"))
+
+  
+  
+  
+output_folders <- c(
+  here("visibility_analysis", "lakes", "output"),
+  here("visibility_analysis", "infrastructure", "power_lines", "output"),
+  here("visibility_analysis", "infrastructure", "staubauten", "output"),
+  here("visibility_analysis", "infrastructure", "verkehrsareal", "output"),
+  here("visibility_analysis", "infrastructure", "versorgungsbauten", "output"),
+  here("visibility_analysis", "infrastructure", "rails", "output"),
+  here("visibility_analysis", "infrastructure", "roads", "output"),
+  here("visibility_analysis", "infrastructure", "roads", "output"),
+  here("visibility_analysis", "infrastructure", "roads", "output"),
+  here("visibility_analysis", "urbanization", "output"),
+  here("visibility_analysis", "forest", "output"))
+
+# Load forest mask once (used for all rasters)
+forest_mask <- st_read(here("TLM", "output", "forest", "forest_tlm3d.gpkg"))
+
+# Create output directories if they don't exist
+for (folder in output_folders) {
+  if (!dir.exists(folder)) {
+    dir.create(folder, recursive = TRUE)
+    
+  }
+}
+
+# Loop through each input file
+for (i in seq_along(input_files)) {
+  
+  
+  # Check if file exists
+  if (!file.exists(input_files[i])) {
+    
+    next
+  }
+  
+  # Read original raster
+  r <- rast(input_files[i])
+  
+  
+  # Step 1: Reclassify binary (values > 0 → 1, else → 0)
+  r_reclass <- ifel(r > 0, 1, 0)
+  
+  # Step 2: Aggregate to 100x100m resolution
+  original_res <- res(r_reclass)[1]  # Assuming square pixels
+  target_res <- 100
+  agg_factor <- round(target_res / original_res)
+
+  r_agg <- aggregate(r_reclass, fact = agg_factor, fun = "max", expand = TRUE)
+  
+  # Step 3: Mask out forest areas on aggregated raster
+  forest_raster <- rasterize(vect(forest_mask), r_agg, field = 1, background = 0)
+  r_masked <- ifel(forest_raster == 1, 0, r_agg)
+  
+  # Step 4: Save final raster
+  base_name <- tools::file_path_sans_ext(basename(input_files[i]))
+  output_name <- paste0(base_name, "_reclassified_masked_100m_adj.tif")
+  output_path <- file.path(output_folders[i], output_name)
+  
+  writeRaster(r_masked, output_path, overwrite = TRUE)
+  
+}
+```
+
+## Infrastructure
+```{r Model all infrastructure raster with declining influence (distance)}
+# Define the list of input paths (raster and vector pairs)
+data_pairs <- tibble::tibble(
+  raster = c(
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_autobahn_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_10_8_6m_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_4_3m_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "rails", "output", "viewshed_rails_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "versorgungsbauten", "output", "versorgungsbauten_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "power_lines", "output", "viewshed_power_lines_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "staubauten", "output", "viewshed_staubaute_QGIS_adj_reclassified_masked_100m_adj.tif"),
+    here("visibility_analysis", "infrastructure", "verkehrsareal", "output", "viewshed_verkehrsareal_adj_reclassified_masked_100m_adj.tif")
+),
+  vector = c(
+    here("TLM", "output", "infrastructure_TLM", "roads", "roads_union_by_type", "roads_autobahn_autostrasse_union.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "roads", "roads_union_by_type", "roads_10m_8m_6m_union.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "roads", "roads_union_by_type", "roads_4m_3m_union.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "rails", "rails_union.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "tlm_bauten_versorgungsbaute_pkt.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "tlm_bauten_leitung.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "tlm_bauten_staubaute.gpkg"),
+    here("TLM", "output", "infrastructure_TLM", "tlm_areale_verkehrsareal.gpkg")
+  )
+)
+
+# Define linear reclassification function (0m = 100, 5000m = 0)
+linear_reclass <- function(dist_raster, max_distance = 15000) {
+  reclassed <- 100 * (1 - (dist_raster / max_distance))
+  reclassed[dist_raster > max_distance] <- NA
+  return(reclassed)
+}
+
+# Processing loop
+for (i in seq_len(nrow(data_pairs))) {
+  cat("Processing:", basename(data_pairs$raster[i]), "\n")
+  
+  # Load raster and vector
+  r <- rast(data_pairs$raster[i])
+  v <- st_read(data_pairs$vector[i], quiet = TRUE)
+  
+  # Convert to SpatVector
+  v_vect <- vect(v)
+  
+  # Create binary mask (only visible cells, >0)
+  visible_mask <- r > 0
+  
+  # Create a dummy raster (1 inside vector features, NA elsewhere)
+  feature_raster <- rasterize(v_vect, r, field = 1)
+  
+  # Calculate Euclidean distance to feature
+  dist_to_feature <- distance(feature_raster)
+  
+  # Mask distances with visibility mask (only consider visible cells)
+  dist_masked <- mask(dist_to_feature, visible_mask, maskvalues = 0, updatevalue = NA)
+  
+  # Apply linear decay
+  influence_raster <- linear_reclass(dist_masked, max_distance = 5000)
+  
+  # Round and enforce 0–100 range
+  influence_raster <- round(influence_raster)
+  influence_raster[influence_raster < 0] <- 0
+  influence_raster[influence_raster > 100] <- 100
+  
+  # Output path
+  output_name <- tools::file_path_sans_ext(basename(data_pairs$raster[i]))
+  output_path <- file.path(dirname(data_pairs$raster[i]), paste0(output_name, "_linearDecay_0to100_adj.tif"))
+  
+  # Write result
+  writeRaster(influence_raster, output_path, overwrite = TRUE)
+}
+
+```
+
+```{r Assign weights to the rasters and combine to one infrastructure raster}
+# Define weights as named variables 
+weight_autobahn          <- 1.0
+weight_roads_10_8_6m     <- 0.7
+weight_roads_4_3m        <- 0.4
+weight_railways          <- 0.7
+weight_leitungen         <- 0.9
+weight_versorgungsbauten <- 0.6
+weight_staubaute         <- 0.4
+weight_verkehrsareal     <- 0.4
+
+#  Explicitly define raster paths + weights
+weights_table <- tibble::tibble(
+  label = c(
+    "Autobahn / Autostrasse",
+    "Strassen 10/8/6m",
+    "Strassen 4/3m",
+    "Eisenbahn",
+    "Leitungen",
+    "Versorgungsbauten",
+    "Staubaute",
+    "Verkehrsareal"
+  ),
+  path = c(
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_autobahn_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_10_8_6m_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "roads", "output", "viewshed_roads_4_3m_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "rails", "output", "viewshed_rails_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "power_lines", "output", "viewshed_power_lines_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "versorgungsbauten","output","versorgungsbauten_viewshed_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "staubauten", "output", "viewshed_staubaute_QGIS_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif"),
+    here("visibility_analysis", "infrastructure", "verkehrsareal",  "output", "viewshed_verkehrsareal_adj_reclassified_masked_100m_adj_linearDecay_0to100_adj.tif")
+  ),
+  weight = c(
+    weight_autobahn,
+    weight_roads_10_8_6m,
+    weight_roads_4_3m,
+    weight_railways,
+    weight_leitungen,
+    weight_versorgungsbauten,
+    weight_staubaute,
+    weight_verkehrsareal
+  )
+)
+
+# Load rasters and apply weights 
+weighted_rasters <- list()
+
+for (i in seq_len(nrow(weights_table))) {
+  label  <- weights_table$label[i]
+  path   <- weights_table$path[i]
+  weight <- weights_table$weight[i]
+  
+  if (!file.exists(path)) {
+    warning("Missing file for ", label, ": ", path)
+    next
+  }
+  
+  cat("Processing:", label, "| Weight:", weight, "\n")
+  r <- rast(path)
+  weighted_rasters[[label]] <- r * weight
+}
+
+if (length(weighted_rasters) == 0) stop("No rasters loaded.")
+
+# Align rasters to the same grid 
+template <- weighted_rasters[[1]]
+
+weighted_rasters_aligned <- lapply(weighted_rasters, function(r) {
+  if (!compareGeom(r, template, stopOnError = FALSE)) {
+    project(r, template, method = "bilinear")
+  } else {
+    r
+  }
+})
+
+# Only keep valid rasters
+weighted_rasters_aligned <- Filter(function(x) inherits(x, "SpatRaster"), weighted_rasters_aligned)
+
+if (length(weighted_rasters_aligned) == 0) stop("No valid rasters to combine.")
+
+# Combine rasters 
+# Check if SpatRaster
+stopifnot(all(sapply(weighted_rasters_aligned, inherits, "SpatRaster")))
+
+# Combine list of rasters into a SpatRaster
+r_stack <- rast(weighted_rasters_aligned)
+
+# Correct way to sum across layers
+composite <- app(r_stack, sum, na.rm = TRUE)
+
+# ---- 6. Normalize to 0–100 using min/max ----
+min_val <- global(composite, "min", na.rm = TRUE)[[1]]
+max_val <- global(composite, "max", na.rm = TRUE)[[1]]
+
+composite_norm <- (composite - min_val) / (max_val - min_val) * 100
+composite_norm <- round(composite_norm)
+
+# Clamp just in case
+composite_norm[composite_norm < 0]   <- 0
+composite_norm[composite_norm > 100] <- 100
+
+# Save output raster 
+output_path <- here("visibility_analysis", "infrastructure", "output", 
+                    "infrastructure_composite_0to100_adj.tif")
+writeRaster(composite_norm, output_path, overwrite = TRUE)
+
+cat("Composite disturbance map saved to:\n", output_path, "\n")
+```
+
+## Streams
+```{r Reclassify visibility raster output for the streams from QGIS, rescale them 100x100m and clip with forest polygons except cells with streams in them}
+# Paths 
+streams_viewshed_path <- here("visibility_analysis", "streams", "FLOZ_viewshed_streams_QGIS_adj.tif")
+streams_vec_path      <- here("TLM", "output", "streams", "FLOZ_filtered_clipped.gpkg")
+forest_vec_path       <- here("TLM", "output", "forest", "forest_tlm3d.gpkg")
+output_folder         <- here("visibility_analysis", "streams", "output")
+
+# Resolution
+target_res <- 100  # 100 x 100 m
+
+# Load data
+r0          <- rast(streams_viewshed_path)
+streams_sf  <- st_read(streams_vec_path, quiet = TRUE) |> st_zm(drop = TRUE, what = "ZM")
+forest_sf   <- st_read(forest_vec_path,  quiet = TRUE)
+
+# Binarize viewshed (values > 0 => 1) 
+r_bin <- ifel(r0 > 0, 1, 0)
+
+# Aggregate to ~100 m using max (binary OR) 
+orig_res  <- res(r_bin)[1]
+fact      <- max(1L, round(target_res / orig_res))
+r_agg     <- aggregate(r_bin, fact = fact, fun = "max", expand = TRUE)
+
+# Rasterize forest to r_agg grid (1 = forest, 0 = non-forest) 
+forest_r <- rasterize(
+  vect(st_transform(forest_sf, crs(r_agg))),
+  r_agg, field = 1, background = 0
+)
+
+# Rasterize streams to r_agg grid (1 = stream present in cell) 
+streams_r <- rasterize(
+  vect(st_transform(streams_sf, crs(r_agg))),
+  r_agg, field = 1, background = 0, touches = TRUE
+)
+
+# Mask logic for streams:
+# forest cells without a stream -> 0; else keep aggregated visibility 
+r_masked <- ifel(forest_r == 1 & streams_r == 0, 0, r_agg)
+
+# Save
+base_name  <- tools:: file_path_sans_ext(basename(streams_viewshed_path))
+out_name   <- paste0(base_name, "_reclassified_masked_100m_adj.tif")
+out_path   <- file.path(output_folder, out_name)
+writeRaster(r_masked, out_path, overwrite = TRUE)
+
+```
+
+```{r Use stream viewshed and FLOZ dataset to calculate exponential decline of influence}
+# Inputs 
+viewshed_path <- here("visibility_analysis", "streams", "output",
+                      "FLOZ_viewshed_streams_QGIS_adj_reclassified_masked_100m_adj.tif")
+streams_FLOZ  <- here("TLM", "output", "streams", "FLOZ_filtered_clipped.gpkg")
+order_field   <- "FLOZ"
+
+# Load data 
+viewshed_raster <- rast(viewshed_path)
+
+streams <- st_read(streams_FLOZ, quiet = TRUE)
+# Ensure streams are in the same CRS as the raster
+if (!is.na(st_crs(streams)) && st_crs(streams)$epsg != crs(viewshed_raster, describe = TRUE)$code) {
+  streams <- st_transform(streams, crs(viewshed_raster))
+}
+
+# Template from viewshed 
+extent_bbox <- ext(viewshed_raster)
+resolution  <- res(viewshed_raster)
+
+template_raster <- rast(
+  extent    = extent_bbox,
+  resolution = resolution[1],
+  crs        = crs(viewshed_raster)
+)
+
+# Lambda values (per 100 m)
+# Small streams (1–4): faster decay; Rivers (5–7): slower decay
+lambda_values <- list(
+  "1" = 0.20,   # d_1/2 ~ 347 m
+  "2" = 0.16,   # d_1/2 ~ 433 m
+  "3" = 0.12,   # d_1/2 ~ 578 m
+  "4" = 0.09,   # d_1/2 ~ 770 m
+  "5" = 0.05,   # d_1/2 ~ 1.39 km
+  "6" = 0.035,  # d_1/2 ~ 1.98 km
+  "7" = 0.02    # d_1/2 ~ 3.47 km
+)
+
+# Prepare FLOZ values 
+floz_values <- sort(unique(streams[[order_field]]))
+floz_values <- floz_values[!is.na(floz_values)]
+cat("Processing FLOZ values:", paste(floz_values, collapse = ", "), "\n")
+
+# Initialize final raster 
+final_raster <- template_raster
+values(final_raster) <- 0
+
+# Loop per FLOZ 
+for (floz in floz_values) {
+  cat("Processing FLOZ:", floz, "\n")
+  
+  current_streams <- streams[streams[[order_field]] == floz, ]
+  if (nrow(current_streams) == 0) next
+  
+  current_streams_vect <- vect(current_streams)
+
+  # Distance to current FLOZ streams (metres)
+  distance_raster <- distance(template_raster, current_streams_vect)
+
+  # Scale distance to 100 m units so λ semantics are "per 100 m"
+  scaled_distance <- distance_raster / 100
+
+  # Get λ; default if missing
+  lambda <- lambda_values[[as.character(floz)]]
+  if (is.null(lambda)) {
+    cat("Warning: No lambda defined for FLOZ", floz, ". Using default 0.02\n")
+    lambda <- 0.02
+  }
+
+  # Exponential decay on [0,1], forced to 0 beyond 5 km
+  decay_values <- ifel(
+    distance_raster <= 6000,
+    exp(-lambda * scaled_distance),
+    0
+  )
+
+  # Combine (max influence across orders)
+  final_raster <- max(final_raster, decay_values, na.rm = TRUE)
+}
+
+# Apply viewshed mask (keeps only visible cells) 
+final_raster <- mask(final_raster, viewshed_raster)
+
+# Final linear rescale to 0–100 
+r_min <- global(final_raster, "min", na.rm = TRUE)[[1]]
+r_max <- global(final_raster, "max", na.rm = TRUE)[[1]]
+
+final_raster <- (final_raster - r_min) / (r_max - r_min) * 100
+
+# Enforce exact bounds
+final_raster <- clamp(final_raster, lower = 0, upper = 100, values = TRUE)
+
+# Save output 
+output_path <- here("visibility_analysis", "streams", "output",
+                    "streams_exponential_decay_FLOZ_0to100_adj.tif")
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+writeRaster(final_raster, output_path, overwrite = TRUE)
+
+
+```
+
+## Lakes
+```{r Model the decline of influence based on distance for the lakes (exponentially)}
+# Load visibility raster and lake points
+vis_raster <- rast(here("visibility_analysis", "lakes", "output", "lakes_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"))
+lake_points <- st_read(here("visibility_analysis", "lakes", "viewpoints", "lakes_viewpoints_100m.gpkg"))
+lake_points_v <- vect(lake_points)
+
+# Rasterize lake points to match visibility raster
+lake_raster <- rasterize(lake_points_v, vis_raster, field = 1)
+
+# Calculate distance raster (distance to nearest lake point)
+distance_raster <- distance(lake_raster)
+
+# Apply exponential decay function
+lambda <- 0.001
+decay_raster <- exp(-lambda * distance_raster)
+
+# Combine with visibility raster
+lake_influence_raster <- vis_raster * decay_raster
+
+# Rescale to 0–100 and round
+lake_influence_scaled <- round(lake_influence_raster * 100)
+
+# Save result
+writeRaster(
+  lake_influence_scaled,
+  here("visibility_analysis", "lakes", "lake_exponential_decay_influence_0to100_adj.tif"),
+  overwrite = TRUE
+)
+
+```
+
+
+```{r Model the decline of influence based on distance for the lakes (linearly)}
+# Load visibility raster and lake points
+vis_raster <- rast(here("visibility_analysis", "lakes", "output",
+                        "lakes_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"))
+lake_points <- st_read(here("visibility_analysis", "lakes", "viewpoints", "lakes_viewpoints_100m.gpkg"), quiet = TRUE)
+lake_points_v <- vect(lake_points)
+
+# Rasterize lake points to match visibility raster
+lake_raster <- rasterize(lake_points_v, vis_raster, field = 1)
+
+# Calculate distance raster (distance to nearest lake point)
+distance_raster <- distance(lake_raster)
+
+# Parameters for linear decay model
+max_distance <- 15000  # 15 km in meters
+max_value <- 100      # maximum influence value
+
+# Linear decay function:
+# At 0 m → max_value
+# At 5000 m → 0
+linear_decay <- function(d) {
+  influence <- pmax(0, max_value - (d / max_distance) * max_value)
+  return(influence)
+}
+
+# Apply linear decay
+decay_raster <- app(distance_raster, linear_decay)
+
+# Restrict to visible cells only (mask out non-visible areas)
+lake_influence_raster <- mask(decay_raster, vis_raster, maskvalue = 0)
+
+# Save result
+writeRaster(
+  lake_influence_raster,
+  here("visibility_analysis", "lakes", "output", "lake_linear_decay_influence_0to100_adj.tif"),
+  overwrite = TRUE
+)
+```
+
+## Forest
+```{r Model the decline of visual influence of forest (expontentially) and set cells inside the forest to maximum}
+# Load visibility raster and forest viewpoint locations
+vis_raster <- rast(here("visibility_analysis", "forest", "output", "forest_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"))
+forest_points_v <- here("visibility_analysis", "forest", "viewpoints", "forest_viewpoints_200m.gpkg") %>%
+  st_read() %>%
+  vect()
+
+# Rasterize forest viewpoint points to match visibility raster
+forest_raster <- rasterize(forest_points_v, vis_raster, field = 1)
+
+# Compute distance raster
+distance_raster <- distance(forest_raster)
+
+# Apply exponential decay
+lambda <- 0.005
+decay_raster <- exp(-lambda * distance_raster)
+
+# Combine with visibility
+forest_influence_raster <- vis_raster * decay_raster
+
+# Rescale to 0–100 and round
+forest_influence_scaled <- round(forest_influence_raster * 100)
+
+# Overwrite forest areas with 100
+# Load forest polygons and rasterize
+forest_poly <- here("TLM", "output", "forest", "forest_tlm3d.gpkg") %>%
+  st_read() %>%
+  vect()
+
+forest_mask_raster <- rasterize(forest_poly, vis_raster, field = 1, background = 0)
+
+# Set values in forested areas to 100
+forest_influence_scaled[forest_mask_raster == 1] <- 100
+
+# Save final result
+writeRaster(
+  forest_influence_scaled,
+  here("visibility_analysis", "forest", "output", "forest_exponential_decay_influence_0to100_adj.tif"),
+  overwrite = TRUE
+)
+
+```
+
+
+```{r Model the decline of visual influence of forest linearly and set cells inside the forest to maximum}
+# Load visibility raster and lake points
+vis_raster <- rast(here("visibility_analysis", "forest", "output",
+                        "forest_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"))
+forest_points <- st_read(here("visibility_analysis", "forest", "viewpoints", "forest_viewpoints_200m.gpkg"), quiet = TRUE)
+forest_points_v <- vect(forest_points)
+
+# Rasterize lake points to match visibility raster
+forest_raster <- rasterize(forest_points_v, vis_raster, field = 1)
+
+# Calculate distance raster (distance to nearest lake point)
+distance_raster <- distance(forest_raster)
+
+# Parameters for linear decay model
+max_distance <- 15000  # 15 km in meters
+max_value <- 100      # maximum influence value
+
+# Linear decay function:
+# At 0 m → max_value
+# At 15000 m → 0
+linear_decay <- function(d) {
+  influence <- pmax(0, max_value - (d / max_distance) * max_value)
+  return(influence)
+}
+
+# Apply linear decay
+decay_raster <- app(distance_raster, linear_decay)
+
+# Restrict to visible cells only (mask out non-visible areas)
+forest_influence_raster <- mask(decay_raster, vis_raster, maskvalue = 0)
+
+# Overwrite forest areas with 100
+# Load forest polygons and rasterize
+forest_poly <- here("TLM", "output", "forest", "forest_tlm3d.gpkg") %>%
+  st_read() %>%
+  vect()
+
+forest_mask_raster <- rasterize(forest_poly, vis_raster, field = 1, background = 0)
+
+# Set values in forested areas to 100
+forest_influence_raster[forest_mask_raster == 1] <- 100
+
+
+# Save result
+writeRaster(
+  forest_influence_raster,
+  here("visibility_analysis", "forest", "output", "forest_linear_decay_influence_0to100_adj.tif"),
+  overwrite = TRUE
+)
+
+```
+
+## Urbanization
+```{r Identify urban area cells from the arealstatistik with at least 3 neighbours}
+# Load point grid 
+pts <- st_read(here("arealstatistik", "arealstatistik_2056.gpkg")) %>%
+  st_make_valid() %>%
+  filter(!is.na(AS18_17))
+
+#  Load and buffer Glarus boundary 
+boundary <- glarus_boundary_15km
+
+# Clip points to buffered boundary 
+pts <- st_intersection(pts, boundary)
+
+# Keep only points with AS_17 == 1 or 2
+pts_as <- pts %>% filter(AS18_17 %in% c(1, 2))
+
+# Create 8-neighbourhood relations (141.5 m)
+neighbour_list <- st_is_within_distance(pts_as, pts_as, dist = 141.5)
+
+# Identify core cells with at least 2 neighbours
+core_indices <- which(sapply(neighbour_list, function(x) length(setdiff(x, NA_integer_)[-1]) >= 2))
+
+# Collect indices of core cells and all their neighbours
+all_indices <- unique(unlist(neighbour_list[core_indices]))
+
+# Subset the point set accordingly
+pts_core_and_neighbors <- pts_as[all_indices, ]
+
+# Export to file
+st_write(
+  pts_core_and_neighbors,
+  here("arealstatistik", "output", "urban_core_points_expanded_adj.gpkg"),
+  delete_dsn = TRUE
+)
+```
+
+```{r Model linear decline in visual influence of urbanization}
+# Load visibility raster and lake points
+vis_raster <- rast(here("visibility_analysis", "urbanization", "output", "buildings_viewshed_QGIS_adj_reclassified_masked_100m_adj.tif"))
+buildings_points <- st_read(here("visibility_analysis", "urbanization", "viewpoints", "urbanization_VP_adj.gpkg"), quiet = TRUE)
+buildings_points_v <- vect(buildings_points)
+
+# Rasterize lake points to match visibility raster
+buildings_raster <- rasterize(buildings_points_v, vis_raster, field = 1)
+
+# Calculate distance raster (distance to nearest lake point)
+distance_raster <- distance(buildings_raster)
+
+# Parameters for linear decay model
+max_distance <- 10000  # 10 km in meters
+max_value <- 100      # maximum influence value
+
+# Linear decay function:
+# At 0 m → max_value
+# At 10000 m → 0
+linear_decay <- function(d) {
+  influence <- pmax(0, max_value - (d / max_distance) * max_value)
+  return(influence)
+}
+
+# Apply linear decay
+decay_raster <- app(distance_raster, linear_decay)
+
+# Restrict to visible cells only (mask out non-visible areas)
+buildings_influence_raster <- mask(decay_raster, vis_raster, maskvalue = 0)
+
+
+# Save result
+writeRaster(
+  buildings_influence_raster,
+  here("visibility_analysis", "urbanization", "output", "urbanization_linear_decay_influence_0to100_adj.tif"),
+  overwrite = TRUE
+)
+```
+
+# Other datasets, for which no visibility analyses were performed will be processed as follows
+## Noise 
+```{r Process noise rasters (street and rails) and classify them }
+# Define input files
+files <- list(
+  roads = here("noise", "output", "noise_roads_day_10m.tif"),
+  rails = here("noise", "output", "noise_rails_day_10m.tif")
+)
+
+# Output folder
+out_folder <- here("noise", "output")
+
+# Define reclassification function
+reclass_noise <- function(raster) {
+  app(raster, fun = function(x) {
+    ifelse(
+      is.na(x), NA,
+      ifelse(x <= 25, 0,
+      ifelse(x <= 35, (x - 25) / (35 - 25) * 25,
+      ifelse(x <= 45, 25 + (x - 35) / (45 - 35) * 25,
+      ifelse(x <= 55, 50 + (x - 45) / (55 - 45) * 25,
+      100))))
+    )
+  })
+}
+
+# Define template raster for 100 m resolution
+template <- rast(files[[1]])
+res(template) <- 100  # set resolution
+template <- extend(template, ext(template))  # make sure extent aligns
+
+# Process and save
+for (name in names(files)) {
+  
+  # Load raster
+  r <- rast(files[[name]])
+  
+  # Reclassify
+  r_reclass <- reclass_noise(r)
+  
+  # Resample to 100 m using bilinear interpolation
+  r_resampled <- resample(r_reclass, template, method = "bilinear")
+  
+  # Output filename
+  out_name <- file.path(out_folder, paste0(tools::file_path_sans_ext(basename(files[[name]])), "_reclassified_100m.tif"))
+  
+  # Save
+  writeRaster(r_resampled, out_name, overwrite = TRUE)
+}
+```
+
+```{r Export "Gebiet mit Lärmbelastung" for Mollis airport and rasterize}
+# Paths
+input_file <- here("noise", "noise_aviation", "sachplan-infrastruktur-luftfahrt_kraft_2056.gpkg")
+layer_name <- "M_SIL_Gebiet_mit_Laermbelastung_in_Kraft_LV95"
+output_folder <- here("noise", "noise_aviation", "output")
+
+# Create output folder if needed
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+
+# Output file paths
+output_vector <- file.path(output_folder, "aviation_noise_clipped.gpkg")
+output_raster <- file.path(output_folder, "aviation_noise_raster_100m.tif")
+
+# Load vector data
+aviation_noise <- st_read(input_file, layer = layer_name, quiet = TRUE)
+
+# Ensure CRS match
+aviation_noise <- st_transform(aviation_noise, st_crs(glarus_polygon_15km))
+
+# Clip noise polygons
+aviation_noise_clipped <- st_intersection(aviation_noise, glarus_polygon_15km)
+
+# Save clipped vector
+st_write(aviation_noise_clipped, output_vector, delete_dsn = TRUE)
+
+# Convert to SpatVector for rasterization
+noise_vect <- vect(aviation_noise_clipped)
+
+# Create raster template (100x100 m)
+template_raster <- rast(ext(noise_vect), resolution = 100, crs = crs(noise_vect))
+
+# Rasterize: assign value 1 to all intersecting cells
+rasterized <- rasterize(noise_vect, template_raster, field = 1, background = 0)
+
+# Save raster
+writeRaster(rasterized, output_raster, overwrite = TRUE)
+```
+
+```{r Adjusted noise classification (maximum value)}
+# Load Glarus boundary
+boundary_vect <- vect(glarus_polygon_15km)
+
+# Create template raster from buffered boundary 
+template <- rast(
+  extent = ext(boundary_vect),
+  resolution = 100,
+  crs = "EPSG:2056"
+)
+values(template) <- NA  # initialize as empty
+
+# Load and project input rasters 
+roads <- rast(here("noise", "output", "noise_roads_day_reclassified_100m.tif"))
+rails <- rast(here("noise", "output", "noise_rails_day_reclassified_100m.tif"))
+roads <- project(roads, template)
+rails <- project(rails, template)
+
+# Resample to align with template 
+roads_resampled <- resample(roads, template, method = "bilinear")
+rails_resampled <- resample(rails, template, method = "bilinear")
+
+# Save aligned roads and rails rasters 
+writeRaster(roads_resampled, here("noise", "output", "noise_roads_aligned_100m.tif"), overwrite = TRUE)
+writeRaster(rails_resampled, here("noise", "output", "noise_rails_aligned_100m.tif"), overwrite = TRUE)
+
+# Load and rasterize aviation noise polygon 
+aviation_sf <- st_read(here("noise", "output", "aviation_noise_clipped.gpkg"), quiet = TRUE)
+aviation_sf <- st_transform(aviation_sf, 2056)
+aviation_vect <- vect(aviation_sf)
+aviation_raster <- rasterize(aviation_vect, template, field = 1, background = 0)
+
+# Force alignment of aviation raster to template 
+aviation_raster_aligned <- resample(aviation_raster, template, method = "near")
+
+# Normalize each noise source separately to 0-100 scale 
+normalize_to_100 <- function(r) {
+  r_min <- global(r, "min", na.rm = TRUE)[[1]]
+  r_max <- global(r, "max", na.rm = TRUE)[[1]]
+  if (r_max == r_min) return(r * 0)  # handle constant rasters
+  (r - r_min) / (r_max - r_min) * 100
+}
+
+roads_normalized <- normalize_to_100(roads_resampled)
+rails_normalized <- normalize_to_100(rails_resampled)
+
+# Aviation gets a fixed penalty of 30 (not normalized to 100)
+aviation_penalty <- aviation_raster_aligned * 30  # Binary: 0 or 30
+
+# Set NA values to 0 (ensures complete coverage) 
+roads_normalized[is.na(roads_normalized)] <- 0
+rails_normalized[is.na(rails_normalized)] <- 0
+aviation_penalty[is.na(aviation_penalty)] <- 0
+
+# Save normalized individual noise rasters 
+writeRaster(roads_normalized, here("noise", "output", "noise_roads_normalized_0to100.tif"), overwrite = TRUE)
+writeRaster(rails_normalized, here("noise", "output", "noise_rails_normalized_0to100.tif"), overwrite = TRUE)
+writeRaster(aviation_penalty, here("noise", "output", "noise_aviation_penalty_30.tif"), overwrite = TRUE)
+
+# Combine using maximum noise approach 
+# Stack all noise rasters (roads and rails normalized 0-100, aviation fixed at 0 or 30)
+noise_stack <- c(roads_normalized, rails_normalized, aviation_penalty)
+
+# For each cell, take the MAXIMUM value across all noise sources
+# This represents the "worst case" - the loudest noise source
+noise_combined <- app(noise_stack, fun = max, na.rm = TRUE)
+
+# Mask to exact buffered boundary
+noise_final <- mask(noise_combined, boundary_vect)
+
+# Save final composite noise raster 
+writeRaster(noise_final, here("noise", "output", "noise_final_max_approach_0to100.tif"), overwrite = TRUE)
+```
+
+## Bird species
+```{r Resample bird species raster to 100x100 m and classify from 0 to 100, smooth }
+# Parameters
+p_hi     <- 0.95       # high-percentile cap
+d_m      <- 150       # Gaussian smoothing radius in meters (~3 cells at 100 m)
+target_m <- 100        # desired output cell size in meters
+out_path <- here("bird_species", "output", "species_density_100m_cap95_gauss150m_0to100.tif")
+
+# Load coarse raster of absolute counts per 1x1 km cell
+species_counts <- rast(here("bird_species", "sum_territories.tif"))
+
+# Compute high-percentile cap on the native-scale counts (robust to outliers)
+q_hi <- global(species_counts, fun = quantile, probs = p_hi, na.rm = TRUE)[[1]]
+if (is.na(q_hi) || q_hi <= 0) stop("Invalid percentile cap (q_hi). Check raster contents.")
+
+# Create a 100 m template aligned to the input extent/CRS
+tpl_100m <- rast(extent = ext(species_counts),
+                 resolution = target_m,
+                 crs = crs(species_counts))
+
+# Bring counts to 100 m using nearest (preserves totals within each coarse cell)
+counts_100m <- resample(species_counts, tpl_100m, method = "near")
+
+# Pre-cap to limit hotspot bleed during smoothing
+counts_cap_pre <- clamp(counts_100m, lower = 0, upper = q_hi, values = TRUE)
+
+# Gaussian kernel and focal smoothing (sum with Gauss kernel ≈ weighted mean)
+kernel <- focalMat(counts_cap_pre, d = d_m, type = "Gauss")
+counts_smooth <- focal(
+  counts_cap_pre,
+  w = kernel,
+  fun = "sum",
+  na.policy = "omit",
+  pad = TRUE
+)
+
+# Post-cap (guards against minor overshoot) and scale to 0–100 using q_hi
+counts_cap_post <- clamp(counts_smooth, lower = 0, upper = q_hi, values = TRUE)
+species_reclass_0_100 <- (counts_cap_post / q_hi) * 100
+
+# Save
+writeRaster(species_reclass_0_100, out_path, overwrite = TRUE)
+```
+
+
+## Air pollution
+```{r Clip, reproject and align air pollution rasters}
+# Define subject and output folders
+subject_folder <- here("air_pollution")
+output_folder <- here("air_pollution", "output")
+
+# Include subject folder + all subfolders (excluding "output")
+all_folders <- dir_ls(subject_folder, type = "directory", recurse = TRUE)
+all_folders <- c(subject_folder, all_folders)
+all_folders <- all_folders[basename(all_folders) != "output"]
+
+# Find all .tif files in all relevant folders
+raster_paths <- all_folders %>%
+  lapply(function(folder) {
+    dir_ls(folder, regexp = "\\.tif$", recurse = FALSE)
+  }) %>%
+  unlist()
+
+# Define target CRS and resolution
+target_crs <- "EPSG:2056"
+target_res <- 100
+
+# Loop through raster files
+for (raster_path in raster_paths) {
+  message("Processing: ", raster_path)
+  raster <- rast(raster_path)
+  
+  # Reproject if needed
+  if (crs(raster) != target_crs) {
+    raster <- project(raster, target_crs)
+  }
+
+  # Resample if resolution differs
+  res_vals <- res(raster)
+  if (!isTRUE(all.equal(res_vals, c(target_res, target_res), tolerance = 1))) {
+    extent_template <- ext(raster)
+    ncol_new <- ceiling((extent_template[2] - extent_template[1]) / target_res)
+    nrow_new <- ceiling((extent_template[4] - extent_template[3]) / target_res)
+    template <- rast(ext = extent_template, crs = target_crs, ncol = ncol_new, nrow = nrow_new)
+    raster <- resample(raster, template, method = "bilinear")
+  }
+
+  # Clip and mask to Glarus boundary
+  clipped_raster <- crop(raster, glarus_polygon_15km)
+  clipped_raster <- mask(clipped_raster, glarus_polygon_15km)
+
+  # Create output path
+  filename_no_ext <- tools::file_path_sans_ext(basename(raster_path))
+  output_filename <- paste0(filename_no_ext, "_prep.tif")
+  output_path <- file.path(output_folder, output_filename)
+
+  # Save
+  writeRaster(clipped_raster, output_path, overwrite = TRUE)
+}
+```
+
+```{r Classify the pollution rasters, add and normalize them from 0 to 100}
+# Load template raster for alignment
+template <- glarus_raster_15km
+
+# Load rasters and align to template
+no2_raster <- rast(here("air_pollution", "output", "luftreinhaltung-stickstoffdioxid_2023_2056_prep.tif")) %>%
+  resample(template, method = "bilinear")
+
+pm10_raster <- rast(here("air_pollution", "output", "luftreinhaltung-feinstaub_pm10_2023_2056_prep.tif")) %>%
+  resample(template, method = "bilinear")
+
+pm25_raster <- rast(here("air_pollution", "output", "luftreinhaltung-feinstaub_pm2_5_2023_2056_prep.tif")) %>%
+  resample(template, method = "bilinear")
+
+ozone_raster <- rast(here("air_pollution", "output", "luftreinhaltung-ozon_2023_2056_prep.tif")) %>%
+  resample(template, method = "bilinear")
+
+# Linear rescaling function (min = best, max = worst)
+rescale_linear <- function(r) {
+  r_min <- global(r, "min", na.rm = TRUE)[1, 1]
+  r_max <- global(r, "max", na.rm = TRUE)[1, 1]
+  (1 - (r - r_min) / (r_max - r_min)) * 100
+}
+
+# Normalize each pollutant raster separately 
+no2_norm  <- rescale_linear(no2_raster)
+pm10_norm <- rescale_linear(pm10_raster)
+pm25_norm <- rescale_linear(pm25_raster)
+ozone_norm <- rescale_linear(ozone_raster)
+
+# Save normalized rasters separately 
+writeRaster(no2_norm,
+  here("air_pollution", "output", "no2_norm_0to100.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(pm10_norm,
+  here("air_pollution", "output", "pm10_norm_0to100.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(pm25_norm,
+  here("air_pollution", "output", "pm25_norm_0to100.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(ozone_norm,
+  here("air_pollution", "output", "ozone_norm_0to100.tif"),
+  overwrite = TRUE
+)
+
+# Combine (equal weight: simple mean) 
+air_pollution_combined_normalized <- (no2_norm + pm10_norm + pm25_norm + ozone_norm) / 4
+
+# Mask to study area 
+air_pollution_combined_normalized <- air_pollution_combined_normalized %>%
+  mask(template)
+
+# Save combined raster 
+writeRaster(
+  air_pollution_combined_normalized,
+  here("air_pollution", "output", "air_pollution_combined_linear_norm_0to100.tif"),
+  overwrite = TRUE
+)
+
+```
+
+## Stench
+```{r Create binary raster for stench}
+# Load and filter TLM areale for wastewater and incineration
+tlm <- st_read(here("TLM", "output", "SWISSTLM3D_2025_clipped.gpkg"),
+               layer = "tlm_areale_nutzungsareal", quiet = TRUE) %>%
+  st_transform(2056) %>%
+  filter(objektart %in% c("Abwasserreinigungsareal", "Kehrichtverbrennungsareal"))
+tlm_buffered <- st_buffer(tlm, dist = 300)
+
+# Load agricultural data and harmonize geometry column
+agri <- st_read(here("stench", "agriculture", "pub_ch_lw_nutzung.gpkg"),
+                layer = "bew_betrieb", quiet = TRUE) %>%
+  st_transform(2056)
+
+# Rename geometry column to match "geom"
+names(agri)[which(names(agri) == "geometrie")] <- "geom"
+st_geometry(agri) <- "geom"
+
+# Buffer agricultural points by 150 m
+agri_buffered <- st_buffer(agri, dist = 150)
+
+# Combine both buffered datasets using matching geometry column
+combined_sf <- bind_rows(
+  tlm_buffered,
+  agri_buffered 
+)
+
+# Union and convert to sf
+combined_union <- st_union(st_geometry(combined_sf)) %>%
+  st_sf(geometry = .)
+
+# Create 100 m raster based on buffered canton boundary
+template_raster <- rast(
+  extent = ext(vect(glarus_polygon_15km)),
+  resolution = 100,
+  crs = "EPSG:2056"
+)
+values(template_raster) <- 0
+
+# Rasterize the buffer: 1 = intersect, 0 = no intersect
+buffer_vect <- vect(combined_union)
+smell_raster <- rasterize(buffer_vect, template_raster, field = 50, background = 0)
+
+# Save the binary output
+writeRaster(
+  smell_raster,
+  here("stench", "output", "smell_raster_binary.tif"),
+  overwrite = TRUE
+)
+
+```
+
+
+```{r Stench: exponential decline}
+# Parameters 
+h_agri    <- 75     # half-distance [m]
+cut_agri  <- 150    # cut-off [m]
+h_sites   <- 150    # half-distance [m]
+cut_sites <- 300    # cut-off [m]
+
+# Agriculture polygons (e.g., farms)
+agri_gpkg   <- here("stench", "agriculture", "pub_ch_lw_nutzung.gpkg")
+agri_layer  <- "bew_betrieb"
+
+# Sites (WWTP + WIP) from your TLM layer (polygons)
+sites_sf <- st_read(
+  here("TLM", "output", "SWISSTLM3D_2025_clipped.gpkg"),
+  layer = "tlm_areale_nutzungsareal",
+  quiet = TRUE
+) %>%
+  st_transform(2056) %>%
+  filter(objektart %in% c("Abwasserreinigungsareal", "Kehrichtverbrennungsareal"))
+
+# Outputs 
+out_agri_100  <- here("stench", "output", "stench_agriculture_100m_0to100.tif")
+out_sites_100 <- here("stench", "output", "stench_sites_100m_0to100.tif")
+out_combined  <- here("stench", "output", "stench_influence_100m_0to100.tif")
+
+# Boundary
+boundary_v <- glarus_polygon_15km %>% vect()
+
+target100  <- boundary_v %>%
+  { rast(ext(.), resolution = 100, crs = crs(.)) }
+
+hires10    <- target100 %>% disagg(fact = 10, method = "near")  # 10 m grid aligned to 100 m
+
+# Helper 
+compute_influence <- function(src_sf, hires10, target100, boundary_v, h, cutoff) {
+  # Empty input → zero raster aligned & masked
+  if (!inherits(src_sf, "sf") || nrow(src_sf) == 0) {
+    return(
+      target100 %>%
+        init() %>%
+        { values(.) <- 0; . } %>%
+        mask(boundary_v)
+    )
+  }
+
+  # Prepare sources (CRS, valid, vectorize)
+  src_v <- src_sf %>%
+    st_transform(crs = crs(hires10)) %>%
+    st_make_valid() %>%
+    vect()
+
+  # Burn sources at 10 m (1 on-source, NA elsewhere)
+  r_src10 <- src_v %>%
+    rasterize(hires10, field = 1, background = NA, touches = TRUE)
+
+  # If nothing burned in → zeros
+  if (r_src10 %>% values() %>% is.na() %>% all()) {
+    return(
+      target100 %>%
+        init() %>%
+        { values(.) <- 0; . } %>%
+        mask(boundary_v)
+    )
+  }
+
+  # Distance & exponential decay
+  d10 <- r_src10 %>% distance()               # metres
+  lambda <- log(2) / h
+  I10 <- exp(-lambda * d10)                   # (0,1]; 1 on-source
+  I10[is.na(d10)] <- 0
+  if (!is.null(cutoff)) I10 <- ifel(d10 > cutoff, 0, I10)
+
+  # Aggregate → enforce template geom → mask → scale
+  I100 <- I10 %>%
+    aggregate(fact = 10, fun = mean, na.rm = TRUE) %>%
+    resample(target100, method = "bilinear") %>%
+    mask(boundary_v)
+
+  I100 * 100
+}
+
+# Agriculture 
+emitters_agri <- st_read(agri_gpkg, layer = agri_layer, quiet = TRUE)
+I100_agri <- compute_influence(emitters_agri, hires10, target100, boundary_v, h = h_agri, cutoff = cut_agri) %>%
+  clamp(lower = 0, upper = 100, values = TRUE)
+
+I100_agri %>% writeRaster(out_agri_100, overwrite = TRUE)
+
+# Sites (WWTP + WIP) 
+I100_sites <- compute_influence(sites_sf, hires10, target100, boundary_v, h = h_sites, cutoff = cut_sites) %>%
+  clamp(lower = 0, upper = 100, values = TRUE)
+
+I100_sites %>% writeRaster(out_sites_100, overwrite = TRUE)
+
+# Combine (terra::max), clamp, save
+combined <- max(I100_agri, I100_sites, na.rm = TRUE) %>%
+  clamp(lower = 0, upper = 100, values = TRUE)
+
+combined %>% writeRaster(out_combined, overwrite = TRUE)
+```
+
+## View
+```{r Process VisibilityMap }
+# Paths
+in_vm      <- here("VM", "VM_5000_CH_Prozent.tif")
+in_bound   <- here("glarus_boundary_5kmbuffer.gpkg")
+in_forest  <- here("TLM", "output", "forest", "forest_tlm3d.gpkg")
+out_path   <- here("VM", "output", "VisibiilityMap_reclassfied_0to100.tif")
+
+# Load data
+vm         <- rast(in_vm)
+bound_sf   <- st_read(in_bound, quiet = TRUE) %>% st_transform(st_crs(vm))
+forest_sf  <- st_read(in_forest, quiet = TRUE) %>% st_transform(st_crs(vm))
+bound_v    <- vect(bound_sf)
+forest_v   <- vect(forest_sf)
+
+# Clip to 5 km-buffer boundary (crop + mask)
+vm_clip <- vm %>%
+  crop(bound_v) %>%
+  mask(bound_v)
+
+# Remove forested cells (keep non-forest)
+vm_no_forest <- mask(vm_clip, forest_v, inverse = TRUE)
+
+# Project to LV95 (EPSG:2056)
+vm_lv95 <- project(vm_no_forest, "EPSG:2056", method = "bilinear")
+
+# Create exact 100 m LV95 template aligned to grid
+tmpl_lv95 <- rast(
+  ext(vm_lv95),
+  crs = "EPSG:2056",
+  resolution = 100
+)
+origin(tmpl_lv95) <- c(0, 0)  # align to LV95 grid
+
+# Resample to template (100 m)
+vm_100m <- resample(vm_lv95, tmpl_lv95, method = "bilinear")
+
+# Normalize to 0–100
+mm <- global(vm_100m, fun = c("min", "max"), na.rm = TRUE) %>% as.numeric()
+vmin <- mm[1]; vmax <- mm[2]
+
+if (is.finite(vmin) && is.finite(vmax) && (vmax > vmin)) {
+  vm_0to100 <- ((vm_100m - vmin) / (vmax - vmin)) * 100
+} else {
+  vm_0to100 <- vm_100m * 0
+}
+
+vm_0to100 <- clamp(vm_0to100, lower = 0, upper = 100, values = TRUE)
+
+# 7) Save
+writeRaster(vm_0to100, filename = out_path, overwrite = TRUE, NAflag = -9999)
+```
+
+## Remoteness
+```{r Process labes remoteness raster}
+# Load data 
+r <- rast(here("remoteness", "remoteness_labes_2020_distance_mins.tif"))
+
+# Clip raster
+r_clip <- r %>%
+  crop(glarus_polygon_15km) %>%
+  mask(glarus_polygon_15km)
+
+# Reclassify to range 0–100 ===
+# Get min/max values from clipped raster
+r_min <- global(r_clip, "min", na.rm = TRUE)[[1]]
+r_max <- global(r_clip, "max", na.rm = TRUE)[[1]]
+
+r_reclass <- (r_clip - r_min) / (r_max - r_min) * 100
+
+# Save output 
+writeRaster(r_reclass,
+            here("remoteness", "output", "remoteness_labes_2020_distance_reclassified.tif"),
+            overwrite = TRUE)
+
+```
+
+## Starry sky
+```{r Preprocess light pollution raster}
+# Load data
+r <- rast(here("light_emission", "LABES_export.tif"))
+
+# Reproject raster to LV95 (EPSG:2056) if needed
+r_lv95 <- project(r, "EPSG:2056")
+
+# Clip raster to Glarus 15 km polygon
+r_clip <- r_lv95 %>%
+  crop(glarus_polygon_15km) %>%
+  mask(glarus_polygon_15km)
+
+# Create 100 m resolution template (aligned with LV95 CRS)
+template_100m <- rast(
+  extent = ext(glarus_polygon_15km),
+  resolution = 100,
+  crs = "EPSG:2056"
+)
+
+# Resample to 100 m
+r_clip_100m <- resample(r_clip, template_100m, method = "bilinear")
+
+# Get min/max values
+r_min <- global(r_clip_100m, "min", na.rm = TRUE)[[1]]
+r_max <- global(r_clip_100m, "max", na.rm = TRUE)[[1]]
+
+# Scale to 0–100
+r_scaled <- (r_clip_100m - r_min) / (r_max - r_min) * 100
+
+# Invert so that low emission = 100, high emission = 0
+r_reclass <- 100 - r_scaled
+
+# Save output
+writeRaster(
+  r_reclass,
+  here("light_emission", "output", "light_emission_reclassified_100m.tif"),
+  overwrite = TRUE
+)
+```
+
+## Human presence
+```{r Extract photos from Flickr}
+
+# Your Flickr API Key
+api_key <- "xyz123"  # Replace with your actual API key
+
+# Define bounding box for Glarus [xmin, ymin, xmax, ymax]
+bbox <- c(8.85, 46.85, 9.25, 47.15)
+
+# Flickr base URL
+url <- "https://api.flickr.com/services/rest/"
+
+# First request to determine total number of pages
+initial_res <- GET(url, query = list(
+  method = "flickr.photos.search",
+  api_key = api_key,
+  bbox = paste(bbox, collapse = ","),
+  has_geo = 1,
+  extras = "geo,url_o,date_taken,license",
+  format = "json",
+  nojsoncallback = 1,
+  per_page = 100,
+  page = 1
+))
+
+parsed <- fromJSON(content(initial_res, as = "text"))
+total_pages <- as.numeric(parsed$photos$pages)
+message("Total pages: ", total_pages)
+
+# Fetch all pages
+all_photos <- list()
+
+for (page_num in 1:total_pages) {
+  message("Fetching page ", page_num, " of ", total_pages)
+  
+  res <- GET(url, query = list(
+    method = "flickr.photos.search",
+    api_key = api_key,
+    bbox = paste(bbox, collapse = ","),
+    has_geo = 1,
+    extras = "geo,url_o,date_taken,license",
+    format = "json",
+    nojsoncallback = 1,
+    per_page = 100,
+    page = page_num
+  ))
+  
+  photo_page <- fromJSON(content(res, as = "text"))$photos$photo
+  all_photos[[page_num]] <- photo_page
+}
+
+# Combine and clean
+photos_df <- lapply(all_photos, function(x) {
+  as_tibble(flatten(x))  # flatten nested list-columns
+}) %>% bind_rows()
+
+# Drop list-columns to avoid GeoPackage write errors
+photos_df_clean <- photos_df %>%
+  select(where(~ !is.list(.)))  # drop list-type columns
+
+# Convert to sf object (initially in WGS 84)
+photos_sf <- photos_df_clean %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  mutate(latitude = as.numeric(latitude),
+         longitude = as.numeric(longitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# Reproject to Swiss coordinate system (EPSG:2056)
+photos_sf_lv95 <- st_transform(photos_sf, crs = 2056)
+
+# Save as GeoPackage
+st_write(
+  photos_sf_lv95,
+  here::here("output_flickr", "flickr_images_glarus_lv95.gpkg"),
+  driver = "GPKG",
+  delete_layer = TRUE
+)
+
+```
+
+```{r Clean images}
+# paths
+in_path   <- here("presence_people", "output_flickr", "flickr_images_glarus_LV95.gpkg")
+out_path  <- here("presence_people", "output_flickr", "flickr_images_glarus_LV95_cleaned_5kmbuffer.gpkg")
+
+flickr <- st_read(in_path, quiet = TRUE)
+
+#  clip
+flickr <- flickr[glarus_polygon_15km, ]
+
+# Parse datetime (assume local time in Glarus) 
+# If your timestamps are actually UTC, set tz = "UTC".
+flickr <- flickr %>%
+  mutate(datetaken = ymd_hms(datetaken, tz = "Europe/Zurich", quiet = TRUE)) %>%
+  filter(!is.na(datetaken))
+
+# 1 point per hour
+flickr_clean <- flickr %>%
+  mutate(hour_bucket = floor_date(datetaken, unit = "hour")) %>%
+  group_by(owner, hour_bucket) %>%
+  slice_min(order_by = datetaken, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-hour_bucket)
+
+# save
+st_write(flickr_clean, out_path, delete_dsn = TRUE, quiet = TRUE)
+
+```
+
+```{r Adaptive KDE for people presence}
+# Inputs 
+pts_path      <- here("presence_people", "output_flickr", "flickr_images_glarus_LV95_cleaned_5kmbuffer.gpkg")
+boundary_path <- here("glarus_buffer_15km.gpkg") 
+
+# Output
+out_tif <- here("presence_people", "output_flickr", "presence_people_adaptiveKDE_100m_0to100_5kmbuffer.tif")
+
+# Grid (pixel size) for pilot/adaptive computation [metres]
+eps <- c(100, 100)
+
+# Read and prepare data (LV95 / EPSG:2056) 
+pts <- st_read(pts_path, quiet = TRUE)
+if (is.na(st_crs(pts))) stop("Points have no CRS. Please assign/transform to EPSG:2056.")
+if (st_crs(pts)$epsg != 2056) pts <- st_transform(pts, 2056)
+
+# Window: prefer a boundary; else use convex hull of the points
+if (!is.null(boundary_path)) {
+  bnd <- st_read(boundary_path, quiet = TRUE) |>
+    st_transform(2056) |>
+    st_union() |>
+    st_make_valid() |>
+    st_collection_extract("POLYGON")
+  win <- as.owin(bnd)  # recent spatstat supports as.owin.sf
+} else {
+  hull <- pts |> st_union() |> st_convex_hull()
+  win  <- as.owin(hull)
+}
+
+# ppp object
+xy <- st_coordinates(pts)
+X  <- ppp(x = xy[,1], y = xy[,2], window = win, check = FALSE)
+
+# Pilot bandwidth selection (scalar, metres)
+pilot_sigma <- bw.diggle(X)  # sensible default for point patterns
+
+# Pilot density (fixed KDE) on 100 m grid 
+pilot_im <- density.ppp(
+  X, sigma = pilot_sigma, at = "pixels", edge = TRUE, eps = eps
+)
+
+# Adaptive KDE (Abramson, 1982) 
+# local bandwidths scaled by inverse sqrt of pilot intensity
+akde_im <- adaptive.density(
+  X, method = "kernel", pilot = pilot_im, at = "pixels", edge = TRUE
+)
+
+# Convert to GeoTIFF and normalize to 0–100 
+# spatstat image -> terra raster
+df <- as.data.frame(akde_im)  # columns: x, y, value (intensity)
+r  <- rast(x = df[, c("x","y","value")], type = "xyz", crs = "EPSG:2056")
+
+# Mask by boundary if available (before normalization to keep NA outside)
+if (!is.null(boundary_path)) {
+  r <- mask(r, vect(bnd))
+}
+
+# Clip extreme top values before normalization (to avoid a few hotspots compressing the rest)
+v    <- values(r, mat = FALSE)
+q99  <- quantile(v, 0.99, na.rm = TRUE)
+vcap <- pmin(v, q99)
+
+# Min–max to 0–100
+vmin <- min(vcap, na.rm = TRUE)
+vmax <- max(vcap, na.rm = TRUE)
+if (is.finite(vmin) && vmax > vmin) {
+  vnorm <- (vcap - vmin) / (vmax - vmin) * 100
+} else {
+  vnorm <- vcap * 0
+}
+values(r) <- vnorm
+
+# Enforce exact 100 m x 100 m grid and snap to 100 m
+# Build a 100 m template snapped to multiples of 100 m
+res100 <- 100
+e <- ext(r)
+xmin <- floor(xmin(e) / res100) * res100
+ymin <- floor(ymin(e) / res100) * res100
+xmax <- ceiling(xmax(e) / res100) * res100
+ymax <- ceiling(ymax(e) / res100) * res100
+
+template100 <- rast(ext(xmin, xmax, ymin, ymax), resolution = res100, crs = crs(r))
+
+# Resample to the exact 100 m grid
+r100 <- resample(r, template100, method = "bilinear")
+
+# If you have a boundary, re-mask after resample to clean the edges
+if (!is.null(boundary_path)) {
+  r100 <- mask(r100, vect(bnd))
+}
+
+# Clamp to [0,100] to counter tiny numeric overshoots from interpolation
+r100 <- clamp(r100, 0, 100, values = TRUE)
+
+# Save
+writeRaster(r100, out_tif, overwrite = TRUE)
+cat("Adaptive KDE (0–100), snapped to EXACT 100 m grid, written to:", out_tif, "\n")
+```
+
+# The next and last step constitutes of weighting and combining the rasters to the Tranquility Index
+```{r Weigh and combine the rasters}
+# Settings
+target_crs <- "EPSG:2056"
+
+# Helpers
+ensure_dir <- function(path) {
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+  invisible(path)
+}
+
+must_rast <- function(path) {
+  if (!file.exists(path)) stop("Missing file: ", path, call. = FALSE)
+  rast(path)
+}
+
+prep <- function(path, template) {
+  must_rast(path) %>%
+    project(template, method = "bilinear") %>%          # align CRS/grid/res
+    app(function(x) ifelse(is.na(x), 0, x))             # NA -> 0
+}
+
+weighted_sum <- function(r_list, w) {
+  stopifnot(length(r_list) == length(w))
+  w <- w / sum(w)                                       # normalize within group
+  map2(r_list, w, ~ .x * .y) %>% reduce(`+`)
+}
+
+# Input paths 
+remoteness_final          <- here("remoteness", "output", "remoteness_labes_2020_distance_reclassified.tif")
+fresh_air_final           <- here("air_pollution", "output", "air_pollution_combined_linear_norm_0to100.tif")
+light_emission_final      <- here("light_emission", "output", "light_emission_reclassified_100m.tif")
+forest_linear_final       <- here("visibility_analysis", "forest", "output", "forest_linear_decay_influence_0to100_adj.tif")
+lakes_linear_final        <- here("visibility_analysis", "lakes", "output", "lake_linear_decay_influence_0to100_adj.tif")
+streams_exponential_final <- here("visibility_analysis", "streams", "output", "streams_exponential_decay_FLOZ_0to100_adj.tif")
+view_final                <- here("VM", "output", "VisibilityMap_reclassfied_0to100.tif")
+bird_species_final        <- here("bird_species", "output", "species_density_100m_cap95_gauss150m_0to100.tif")
+
+noise_final                   <- here("noise", "output", "noise_final_max_approach_0to100.tif")
+people_adaptiveKDE_final      <- here("presence_people", "output_flickr", "presence_people_adaptiveKDE_100m_0to100_5kmbuffer.tif")
+stench_final                  <- here("stench", "output", "stench_influence_100m_0to100.tif")
+urbanization_final            <- here("visibility_analysis", "urbanization", "output", "urbanization_linear_decay_influence_0to100_adj.tif")
+infrastructure_traffic_final  <- here("visibility_analysis", "infrastructure", "output", "infrastructure_composite_0to100_adj.tif")
+
+# Weights
+pos_weights <- c(
+  remoteness   = 0.1704554,
+  fresh_air    = 0.1452868,
+  dark_sky     = 0.1715851,
+  forest       = 0.1349614,
+  lakes        = 0.1306176,
+  streams      = 0.1306176,
+  view         = 0.1161136,
+  bird_species = 0.1309803
+)
+
+neg_weights <- c(
+  noise           = 0.2820353,
+  people_presence = 0.1922267,
+  stench          = 0.1645934,
+  urbanization    = 0.1162034,
+  infra_traffic   = 0.2449411
+)
+
+# Outputs
+first_final_path   <- here("combination", "output", "tranquility_final.tif")
+clipped_final_path <- here("combination", "output", "tranquility_final_clipped.tif")
+ensure_dir(first_final_path)
+ensure_dir(clipped_final_path)
+
+# Template grid from visibility map, enforce LV95, NA->0
+template <- view_final %>%
+  must_rast() %>%
+  (\(r) {
+    if (crs(r) != target_crs) {
+      blank <- rast(extent = ext(r), resolution = res(r), crs = target_crs)
+      project(r, blank, method = "bilinear")
+    } else r
+  })() %>%
+  app(function(x) ifelse(is.na(x), 0, x))
+
+# Prepare aligned rasters
+pos_layers <- list(
+  remoteness   = prep(remoteness_final, template),
+  fresh_air    = prep(fresh_air_final, template),
+  dark_sky     = prep(light_emission_final, template),
+  forest       = prep(forest_linear_final, template),
+  lakes        = prep(lakes_linear_final, template),
+  streams      = prep(streams_exponential_final, template),
+  view         = prep(view_final, template),
+  bird_species = prep(bird_species_final, template)
+)
+
+neg_layers <- list(
+  noise           = prep(noise_final, template) * -1,
+  people_presence = prep(people_adaptiveKDE_final, template) * -1,
+  stench          = prep(stench_final, template) * -1,
+  urbanization    = prep(urbanization_final, template) * -1,
+  infra_traffic   = prep(infrastructure_traffic_final, template) * -1
+)
+
+# Weighted sums (not normalized after combining) 
+pos_index <- weighted_sum(pos_layers, pos_weights)
+neg_index <- weighted_sum(neg_layers, neg_weights)
+final_index <- pos_index + neg_index
+
+# Save positive and negative indices separately 
+pos_index_path <- here("combination", "output", "tranquility_positive_index.tif")
+neg_index_path <- here("combination", "output", "tranquility_negative_index.tif")
+
+writeRaster(pos_index, pos_index_path, overwrite = TRUE)
+writeRaster(neg_index, neg_index_path, overwrite = TRUE)
+
+# Save first final raster 
+first_final_path <- here("combination", "output", "tranquility_final.tif")
+writeRaster(final_index, first_final_path, overwrite = TRUE)
+
+# Read canton boundary as SpatVector 
+bound_v <- here("glarus_boundary.gpkg") %>%
+  st_read(quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  vect()
+
+# Ensure lakes are SpatVector 
+lakes_v <- here("TLM", "output", "swissTLMRegio_Product_LV95_clipped.gpkg") %>%
+  st_read(layer = "tlmregio_hydrography_lake", quiet = TRUE) %>%
+  st_transform(target_crs) %>%
+  vect()
+
+# Clip to boundary, mask boundary, remove lakes 
+pos_index_clipped <- pos_index %>%
+  crop(bound_v) %>%
+  mask(bound_v) %>%
+  mask(lakes_v, inverse = TRUE)
+
+neg_index_clipped <- neg_index %>%
+  crop(bound_v) %>%
+  mask(bound_v) %>%
+  mask(lakes_v, inverse = TRUE)
+
+final_index_clipped <- final_index %>%
+  crop(bound_v) %>%
+  mask(bound_v) %>%
+  mask(lakes_v, inverse = TRUE)
+
+# Save clipped results 
+pos_index_clipped_path   <- here("combination", "output", "tranquility_positive_index_clipped.tif")
+neg_index_clipped_path   <- here("combination", "output", "tranquility_negative_index_clipped.tif")
+clipped_final_path       <- here("combination", "output", "tranquility_final_clipped.tif")
+
+writeRaster(pos_index_clipped, pos_index_clipped_path, overwrite = TRUE)
+writeRaster(neg_index_clipped, neg_index_clipped_path, overwrite = TRUE)
+writeRaster(final_index_clipped, clipped_final_path, overwrite = TRUE)
+
+```
+
+
+## Display most influential factor per cell
+```{r Influence of factors in each cell}
+# Compute weighted contributions for each factor
+pos_contribs <- map2(pos_layers, pos_weights, ~ .x * .y)
+neg_contribs <- map2(neg_layers, neg_weights, ~ .x * .y)
+all_contribs <- c(pos_contribs, neg_contribs)
+
+names(all_contribs) <- c(names(pos_weights), names(neg_weights))
+
+# Stack contributions into one multi-layer SpatRaster
+contrib_stack <- rast(all_contribs)
+
+# Dominant factor per cell
+dominant_factor <- app(contrib_stack, fun = function(vals) {
+  if (all(is.na(vals))) return(NA)
+  which.max(abs(vals))    # index of factor with largest abs contribution
+})
+
+# Assign factor names as levels
+levels(dominant_factor) <- data.frame(
+  ID = 1:nlyr(contrib_stack),
+  Factor = names(contrib_stack)
+)
+
+# Save raster
+dominant_factor_path <- here("combination", "output", "tranquility_dominant_factor.tif")
+writeRaster(dominant_factor, dominant_factor_path, overwrite = TRUE)
+
+
+# Dominance strength (gap between strongest & 2nd strongest)
+dominance_strength <- app(contrib_stack, fun = function(vals) {
+  if (all(is.na(vals))) return(NA)
+  sorted <- sort(abs(vals), decreasing = TRUE)
+  if (length(sorted) < 2) return(sorted[1])  # handle single-factor case
+  sorted[1] - sorted[2]
+})
+
+dominance_strength_path <- here("combination", "output", "tranquility_dominance_strength.tif")
+writeRaster(dominance_strength, dominance_strength_path, overwrite = TRUE)
+
+
+# Quick plot with factor names
+# Create labels for categories
+factor_labels <- names(contrib_stack)
+```
+
+
+## Histogram values
+```{r Histogram of tranquility index}
+# Load raster 
+r <- rast(here("combination", "output", "tranquility_final_clipped.tif"))
+
+# Extract values as numeric vector (flatten the 1-column matrix)
+vals <- values(r, na.rm = TRUE)[,1]
+vals <- as.numeric(vals)
+
+# Put into dataframe
+df_vals <- data.frame(val = vals)
+
+# Histogram plot
+p <- ggplot(df_vals, aes(x = val)) +
+  geom_histogram(bins = 200, fill = "steelblue", color = "black") +
+  theme_minimal() +
+  labs(
+    title = "Histogram of Tranquility Index",
+    x = "Tranquility value",
+    y = "Cell count"
+  ) +
+  scale_x_continuous(breaks = seq(floor(min(vals, na.rm = TRUE)),
+                                  ceiling(max(vals, na.rm = TRUE)),
+                                  by = 5))
+
+print(p)
+
+# Save histogram
+ggsave(
+  here("combination", "graphics", "tranquility_histogram.png"),
+  plot = p, dpi = 300, width = 8, height = 5
+)
+
+# Adjusted class breaks and labels 
+breaks <- c(-Inf, -17, 0, 24, 40, 55, Inf)
+labels <- c(
+  "Very low tranquility (–Inf to –17)",
+  "Low tranquility (–16 to 0)",
+  "Moderate tranquility (1 to 24)",
+  "Intermediate tranquility (25 to 40)",
+  "High tranquility (41 to 55)",
+  "Very high tranquility (56 to Inf)"
+)
+
+# Classify values
+cats <- cut(vals, breaks = breaks, labels = labels, include.lowest = TRUE, right = TRUE)
+
+# Counts per class
+counts <- as.data.frame(table(cats)) %>%
+  rename(Class = cats, Cell_count = Freq)
+
+print(counts)
+```
+
+## Extract contiguous cells with very high tranquility
+```{r Polygon extraction (very high tranquility)}
+# Polygon extraction funtcion
+extract_large_patches_polygons <- function(raster_path, threshold = 55, min_area_km2 = 5, 
+                                          save_shapefile = FALSE, output_dir = here("combination", "output")) {
+  
+  # Load data
+  r <- rast(raster_path)
+  
+  # Create binary raster
+  binary <- r > threshold
+  
+  # Identify patches
+  patches <- patches(binary, directions = 8, zeroAsNA = TRUE)
+  
+  # Area calculation
+  pixel_area <- prod(res(r))
+  patch_freq <- freq(patches)
+  patch_freq$area_km2 <- (patch_freq$count * pixel_area) / 1000000
+  
+  # Filter valid patches
+  valid_ids <- patch_freq$value[patch_freq$area_km2 >= min_area_km2]
+  
+  if(length(valid_ids) == 0) {
+    message("No patches >= minmum area found")
+    return(NULL)
+  }
+  
+  # Create rasters for valid, filtered patches
+  filtered_patches <- patches
+  filtered_patches[!patches %in% valid_ids] <- NA
+  
+  # Convert to polygons 
+  polygons <- as.polygons(filtered_patches)
+  
+  # Convert to sf object
+  polygons_sf <- st_as_sf(polygons)
+  
+  # Add attributes
+  polygons_sf$patch_id <- polygons_sf$patches
+  polygons_sf$area_km2 <- patch_freq$area_km2[match(polygons_sf$patch_id, patch_freq$value)]
+  
+  # Compute statistics
+  polygons_sf$mean_value <- NA
+  polygons_sf$max_value <- NA
+  polygons_sf$min_value <- NA
+  
+  for(i in 1:nrow(polygons_sf)) {
+    patch_id <- polygons_sf$patch_id[i]
+    patch_mask <- patches == patch_id
+    patch_values <- r[patch_mask]
+    patch_values <- patch_values[!is.na(patch_values)]
+    
+    if(length(patch_values) > 0) {
+      polygons_sf$mean_value[i] <- mean(patch_values)
+      polygons_sf$max_value[i] <- max(patch_values)
+      polygons_sf$min_value[i] <- min(patch_values)
+    }
+  }
+  
+  # Delete patches column 
+  polygons_sf$patches <- NULL
+  
+  # Optional: Save as shp
+  if(save_shapefile) {
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+    output_file <- file.path(output_dir, "large_patches.shp")
+    st_write(polygons_sf, output_file, delete_dsn = TRUE)
+    message(paste("Polygons saved as:", output_file))
+  }
+  
+  # Give summary
+  message(paste("Found:", nrow(polygons_sf), "Patches >= 2.5 km²"))
+  message(paste("Area:", round(sum(polygons_sf$area_km2), 2), "km²"))
+  message(paste("Area range:", round(min(polygons_sf$area_km2), 2), 
+                "to", round(max(polygons_sf$area_km2), 2), "km²"))
+  
+  return(polygons_sf)
+}
+
+# Usage
+polygons <- extract_large_patches_polygons(here("combination", "output", "tranquility_final_clipped.tif"))
+polygons <- extract_large_patches_polygons(here("combination", "output", "tranquility_final_clipped.tif"), save_shapefile = TRUE)
+
+```
+
+```{r}
+# Load data
+tranq <- rast(here("combination", "output", "tranquility_final_clipped.tif"))
+landcover <- st_read(here("TLM", "output", "swissTLMRegio_Product_LV95_clipped.gpkg"),
+                     layer = "tlmregio_landcover_landcover")
+boundary <- st_read(here("glarus_boundary.gpkg"))
+
+# Clip landcover polygons to boundary 
+landcover_gl <- st_intersection(landcover, boundary)
+
+# Classify raster into categories
+breaks <- c(-26, -15, 0, 35, 45, 55, 69)
+labels <- c(
+  "Very low (–26 to –15)",
+  "Low negative (–14 to 0)",
+  "Low positive (1 to 35)",
+  "Medium (36 to 45)",
+  "High (46 to 55)",
+  "Very high (56 to 69)"
+)
+tranq_cat <- classify(tranq,
+                      rcl = cbind(head(breaks, -1), tail(breaks, -1), 1:6))
+
+# Sample full raster grid (all cells) 
+cells <- as.data.frame(xyFromCell(tranq_cat, 1:ncell(tranq_cat)))
+cells$val <- values(tranq_cat)
+
+# keep only non-NA cells
+cells <- cells[!is.na(cells$val), ]
+
+# convert to sf
+cells_sf <- st_as_sf(cells, coords = c("x", "y"), crs = crs(tranq_cat))
+
+# Spatial join with landcover 
+cells_join <- st_join(cells_sf, landcover_gl["objval"], left = TRUE)
+
+# replace NA with "Not specified"
+cells_join$landcover <- ifelse(is.na(cells_join$objval), "Not specified", cells_join$objval)
+
+# assign tranquility category labels
+cells_join$category <- factor(cells_join$val,
+                              levels = 1:6,
+                              labels = labels)
+
+# Summarise counts 
+df_counts <- cells_join %>%
+  st_drop_geometry() %>%
+  group_by(landcover, category) %>%
+  summarise(cell_count = n(), .groups = "drop")
+
+# Area calculation for normalization 
+landcover_gl$area_m2 <- st_area(landcover_gl)
+areas <- landcover_gl %>%
+  group_by(objval) %>%
+  summarise(total_area_m2 = sum(area_m2), .groups = "drop")
+
+# join areas, exclude "Not specified" (no polygon area)
+df_norm <- df_counts %>%
+  filter(landcover != "Not specified") %>%
+  left_join(areas, by = c("landcover" = "objval")) %>%
+  mutate(area_km2 = as.numeric(total_area_m2) / 1e6,
+         norm_count = cell_count / area_km2)
+
+# Colors
+cat_colors <- c("#d7191c", "#fec980", "#ffffbf", "#c7e8ad", "#80bfab", "#2b83ba")
+
+# Raw counts (with "Not specified") 
+p_grouped <- ggplot(df_counts, aes(x = landcover, y = cell_count, fill = category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = cat_colors) +
+  theme_minimal() +
+  labs(title = "Tranquility categories within TLMRegio landcover classes (raw counts)",
+       x = "Landcover class", y = "Cell count", fill = "Tranquility") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here("combination", "graphics", "tranquility_by_TLMRegio_grouped_raw.png"),
+       plot = p_grouped, dpi = 300, width = 12, height = 6)
+
+# Normalized (exclude "Not specified") 
+p_norm <- ggplot(df_norm, aes(x = landcover, y = norm_count, fill = category)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = cat_colors) +
+  theme_minimal() +
+  labs(title = "Tranquility categories within TLMRegio landcover classes (normalized by area)",
+       x = "Landcover class", y = "Cell count per km²", fill = "Tranquility") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here("combination", "graphics", "tranquility_by_TLMRegio_grouped_norm.png"),
+       plot = p_norm, dpi = 300, width = 12, height = 6)
+```
+```{r}
+# Build df_table with "Not specified" included 
+df_table <- df_counts %>%
+  left_join(areas, by = c("landcover" = "objval")) %>%
+  mutate(area_km2 = as.numeric(total_area_m2) / 1e6,
+         norm_count = ifelse(is.na(area_km2), 0, cell_count / area_km2)) %>%
+  dplyr::select(landcover, category, cell_count, norm_count)
+
+# Ensure categories are ordered 
+tranq_cats <- c(
+  "Very low (–26 to –15)",
+  "Low negative (–14 to 0)",
+  "Low positive (1 to 35)",
+  "Medium (36 to 45)",
+  "High (46 to 55)",
+  "Very high (56 to 69)"
+)
+
+# All landcover classes including "Not specified" 
+landcover_classes <- unique(df_table$landcover)
+
+# Expand grid to all combinations 
+df_full <- expand.grid(landcover = landcover_classes,
+                       category = tranq_cats,
+                       stringsAsFactors = FALSE)
+
+# Join and fill missing with 0 
+df_full <- df_full %>%
+  left_join(df_table, by = c("landcover", "category")) %>%
+  mutate(cell_count = ifelse(is.na(cell_count), 0, cell_count),
+         norm_count = ifelse(is.na(norm_count), 0, norm_count)) %>%
+  arrange(landcover, factor(category, levels = tranq_cats))
+
+df_full <- df_full %>%
+  group_by(landcover) %>%
+  mutate(perc_norm = ifelse(landcover == "Not specified",
+                            NA,
+                            round((norm_count / sum(norm_count)) * 100, 2))) %>%
+  ungroup()
+```
+
+
+## Patches
+```{r Three biggest very tranquil Patches}
+# Load data 
+patches <- st_read(here("combination", "output", "large_patches.gpkg"))
+as_points <- st_read(here("arealstatistik", "output", "arealstatistik_clipped_15km.gpkg"))
+
+# Reproject Arealstatistik points to match patches CRS
+as_points <- st_transform(as_points, st_crs(patches))
+
+# Ensure patches have an ID 
+if (!"patch_id" %in% names(patches)) {
+  patches$patch_id <- seq_len(nrow(patches))
+}
+
+# Spatial join: assign each point to a patch 
+pts_in_patches <- st_join(as_points, patches, join = st_within)
+
+# Keep only points that fall inside patches
+pts_in_patches <- pts_in_patches %>% filter(!is.na(patch_id))
+
+# Count points per patch and AS18_17 class 
+lc_counts <- pts_in_patches %>%
+  st_drop_geometry() %>%
+  group_by(patch_id, AS18_17) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Convert counts to percentages within each patch 
+lc_perc <- lc_counts %>%
+  group_by(patch_id) %>%
+  mutate(perc = count / sum(count) * 100) %>%
+  ungroup()
+
+# Relabel patch IDs for clarity (adapt to your IDs)
+lc_perc$patch_label <- dplyr::recode(as.character(lc_perc$patch_id),
+                                     "191" = "Patch 1",
+                                     "262" = "Patch 2",
+                                     "444" = "Patch 3")
+
+# Relabel AS18_17 classes to English 
+lc_perc$lc_label <- dplyr::recode(as.character(lc_perc$AS18_17),
+  "2"  = "Settlement areas",
+  "3"  = "Traffic areas",
+  "8"  = "Natural meadows, home pastures",
+  "9"  = "Alpine pastures",
+  "10" = "Forest",
+  "11" = "Shrub forest",
+  "12" = "Wooded areas",
+  "13" = "Standing waters",
+  "14" = "Flowing waters",
+  "15" = "Unproductive vegetation",
+  "16" = "Vegetation-free surfaces",
+  "17" = "Glaciers",
+  .default = "Other"
+)
+
+# Plot: grouped barplot for each patch 
+ggplot(lc_perc, aes(x = lc_label, y = perc, fill = patch_label)) +
+  geom_col(position = "dodge") +
+  theme_minimal(base_size = 12) +
+  scale_fill_brewer(palette = "Dark2", name = "Patch") +
+  labs(
+    title = "Land cover composition (AS18_17) by patch",
+    x = "Land cover class",
+    y = "Percentage of cells"
+  ) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+
+
+# Map AS18_17 subclasses to their main AS18_4 classes 
+lc_perc <- lc_perc %>%
+  mutate(main_class = dplyr::case_when(
+    AS18_17 %in% c("2", "3") ~ "Settlement areas",
+    AS18_17 %in% c("8", "9") ~ "Agricultural land",
+    AS18_17 %in% c("10", "11", "12") ~ "Stocked areas",
+    AS18_17 %in% c("13", "14", "15", "16", "17") ~ "Unproductive land",
+    TRUE ~ "Other"
+  ))
+
+# Plot: barplot grouped by main class 
+ggplot(lc_perc, aes(x = lc_label, y = perc, fill = patch_label)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ main_class, scales = "free_x", nrow = 1) +  # group subclasses into main classes
+  theme_minimal(base_size = 12) +
+  scale_fill_brewer(palette = "Dark2", name = "Patch") +
+  labs(
+    title = "Land cover composition grouped by 4 main classes",
+    x = "Land cover subclass",
+    y = "Percentage of cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+
+p <- ggplot(lc_perc, aes(x = lc_label, y = perc, fill = patch_label)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ main_class, scales = "free_x", nrow = 1) + 
+  theme_minimal(base_size = 12) +
+  scale_fill_brewer(palette = "Dark2", name = "Patch") +
+  labs(
+    title = "Land cover composition grouped by 4 main classes",
+    x = "Land cover subclass",
+    y = "Percentage of cells"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+# Save with increased width
+ggsave(
+  here("combination", "graphics", "landcover_patch_facets.png"),
+  plot = p,
+  width = 14,   # make it wider (default ~7)
+  height = 5,   # adjust as needed
+  dpi = 300
+)
+```
+
