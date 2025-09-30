@@ -34,15 +34,15 @@ tranquility_glarus/
 ## Data Requirements
 
 The following datasets must be obtained:
-	•	Boundaries: SwissBOUNDARIES3D (swisstopo)
-	•	Topographic Data: SwissTLM3D & TLMRegio (swisstopo)
-	•	Air Pollution: NO₂, PM₁₀, PM₂.₅, O₃ rasters (BAFU)
-	•	Noise: Road and rail noise (BAFU); aviation noise via SIL perimeter (Mollis)
-	•	Light Emission: LABES dataset (BAFU)
-	•	Remoteness: LABES travel-time dataset (BAFU)
-	•	Biodiversity: Swiss Bird Atlas (Vogelwarte)
-	•	Land Cover: Arealstatistik (swisstopo)
-	•	Human Presence: Flickr API (geotagged images; must be collected by user)
+- **Boundaries:** SwissBOUNDARIES3D (swisstopo)  
+- **Topographic Data:** SwissTLM3D & TLMRegio (swisstopo)  
+- **Air Pollution:** NO₂, PM₁₀, PM₂.₅, O₃ rasters (BAFU)  
+- **Noise:** Road and rail noise (BAFU); aviation noise via SIL perimeter (BAZL)  
+- **Light Emission:** LABES dataset
+- **Remoteness:** LABES travel-time dataset  
+- **Bird song:** Swiss Bird Atlas (Vogelwarte)  
+- **Land Cover:** Arealstatistik (swisstopo)  
+- **Human Presence:** Flickr API (geotagged images; must be collected by user)  
 
 For reproducibility, the repository provides placeholders and directory structure under /data/.
 After obtaining the datasets, place them in the respective subfolders following the provided structure.
