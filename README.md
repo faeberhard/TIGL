@@ -18,14 +18,16 @@ tranquility_glarus/
 │   ├── bird_species/         # Swiss Bird Atlas (Vogelwarte)
 │   ├── noise/                # Road, rail, aviation noise (BAFU, SIL)
 │   ├── light_emission/       # LABES dataset (BAFU)
-│   ├── stench/                # Agricultural + features from TLM (waste inciniration plants and wastewater treatment facilities)
+│   ├── stench/               # Agricultural sites + features from TLM (waste inciniration plants and wastewater treatment facilities)
 │   ├── presence_people/      # Flickr API derived data
 │   ├── remoteness/           # LABES accessibility dataset
 │   ├── arealstatistik/       # Arealstatistik (swisstopo)
 │   └── VM/                   # VisibilityMap©
+│   └── visibility_analysis/  # Output of QGIS Viewshed tool
+│   └── DTM/                  # Digital Terrain Model used for the visibility analyses
+
 │
 ├── outputs/                  # Generated analysis results (empty, created by scripts)
-│   ├── rasters/              # Processed tranquility factor rasters
 │   ├── combination/          # Final tranquility index maps
 │   ├── graphics/             # Histograms, patch plots, visualizations
 │   └── patches/              # High-tranquility patch shapefiles + statistics
@@ -44,6 +46,9 @@ The following datasets must be obtained and placed in the `/data/` directory str
 - **Bird Song:** Swiss Bird Atlas (Vogelwarte)  
 - **Land Cover:** Arealstatistik (swisstopo)  
 - **Human Presence:** Flickr API (geotagged images; must be collected by user)  
+- **DTM**: Digital Terrain Model from swisstopo
+- **Stench**: Agricultural sites from Geoinformation Kanton Glarus
+
 
 The workflow proceeds in four main steps:  
 - **Prepares data:** Loads packages, sets project root, extracts and buffers the Glarus boundary, creates a 100 m raster template, and clips national datasets (TLM, FLOZ, Arealstatistik).  
